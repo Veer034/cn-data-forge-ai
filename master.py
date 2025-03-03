@@ -1,17 +1,14 @@
-import datetime
-import json
-import os
 import re
-import uuid
-import nltk
-from sentence_transformers import SentenceTransformer
-from elasticsearch import AsyncElasticsearch
+import json
 import logging
 import asyncio
-from confluent_kafka import Consumer, Producer, KafkaException, TopicPartition
-from confluent_kafka.admin import AdminClient, NewTopic
-import httpx
-from config import KAFKA_CONFIG, ES_CONFIG
+import datetime
+from typing import List, Dict, Any, Optional, Tuple, Set
+from sentence_transformers import SentenceTransformer
+from elasticsearch import AsyncElasticsearch
+from confluent_kafka import Consumer, Producer, KafkaException
+from pydantic import BaseModel
+from config import KAFKA_CONFIG,ES_CONFIG
 
 # Configure logging
 logging.basicConfig(
@@ -20,191 +17,66 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-async def publish_document_to_kafka(producer, topic, content, tenant_id, metadata=None):
-    """
-    Publishes a document to a Kafka topic, preserving existing metadata.
-    
-    Args:
-        producer: KafkaProducer instance
-        topic: Kafka topic to publish to
-        content: Document content
-        tenant_id: Tenant identifier
-        metadata: Optional existing metadata dictionary
-    
-    Returns:
-        Future for the message delivery
-    """
-    if metadata is None:
-        metadata = {}
-    
-    # Create base message
-    message = {
-        'tenant_id': tenant_id,
-        'content': content,
-        'metadata': metadata.copy()  # Use a copy to avoid modifying the original
-    }
-    
-    # Add timestamp if not present
-    if 'timestamp' not in message['metadata']:
-        message['metadata']['timestamp'] = datetime.datetime.now().isoformat()
-    
-    # Only detect document_type if not already provided
-    if 'document_type' not in message['metadata']:
-        message['metadata']['document_type'] = detect_document_type(content)
-    
-    # Only detect language if not already provided
-    if 'language' not in message['metadata']:
-        message['metadata']['language'] = detect_language(content)
-    
-    # Serialize and publish
-    serialized_message = json.dumps(message).encode('utf-8')
-    
-    # Create an asyncio Future to wait for delivery report
-    future = asyncio.Future()
-    
-    def delivery_callback(err, msg):
-        if err:
-            future.set_exception(Exception(f"Message delivery failed: {err}"))
-        else:
-            future.set_result(msg)
-    
-    producer.produce(topic, serialized_message, callback=delivery_callback)
-    producer.poll(0)  # Trigger delivery callbacks
-    
-    return await future
+class DataStorageDto(BaseModel):
+    tenantId: str
+    documentId: str
+    status: str
 
-def detect_document_type(content):
-    """
-    Attempts to detect the document type based on content patterns.
-    Works with multiple languages by focusing on structural elements.
-    """
-    # Look for FAQ patterns in multiple languages
-    faq_patterns = [
-        r'FAQ|Frequently Asked Questions',  # English
-        r'Preguntas Frecuentes|FAQ',        # Spanish
-        r'FAQs|Foire Aux Questions',        # French
-        r'常见问题|FAQ',                     # Chinese
-        r'よくある質問|FAQ',                  # Japanese
-        r'Häufig gestellte Fragen|FAQ'      # German
-    ]
-    
-    if any(re.search(pattern, content, re.IGNORECASE) for pattern in faq_patterns):
-        return 'faq'
-    
-    # Document type detection based on structure rather than language
-    # Count question marks (works in most languages)
-    question_count = len(re.findall(r'\?|？|¿', content))
-    
-    if question_count > 5:
-        return 'qa_content'
-    
-    # Look for policy indicators (structural elements common in policies)
-    policy_patterns = [
-        r'Policy|Terms|Conditions',         # English
-        r'Política|Términos|Condiciones',   # Spanish
-        r'Politique|Conditions|Termes',     # French
-        r'政策|条款|条件',                   # Chinese
-        r'ポリシー|規約|条件',                # Japanese
-        r'Richtlinie|Bedingungen'           # German
-    ]
-    
-    if any(re.search(pattern, content, re.IGNORECASE) for pattern in policy_patterns):
-        return 'policy'
-    
-    # Look for article/blog indicators
-    article_patterns = [
-        r'Article|Blog|Post',               # English
-        r'Artículo|Blog|Entrada',           # Spanish
-        r'Article|Blog|Publication',        # French
-        r'文章|博客|帖子',                   # Chinese
-        r'記事|ブログ|投稿',                  # Japanese
-        r'Artikel|Blog|Beitrag'             # German
-    ]
-    
-    if any(re.search(pattern, content, re.IGNORECASE) for pattern in article_patterns):
-        return 'article'
-    
-    # Default type
-    return 'general'
+class ChunkMetadata(BaseModel):
+    hasQuestion: bool = False
+    documentType: str = "general"
+    language: str = "en"
+    qaFormat: Optional[str] = None
+    question: Optional[str] = None
+    chunkIndex: int = 0
+    totalChunks: int = 1
 
-def detect_language(content):
-    """
-    Language detection that works with multiple languages.
-    Falls back to basic detection if langdetect is not available.
-    """
-    try:
-        from langdetect import detect
-        return detect(content)
-    except (ImportError, Exception) as e:
-        logger.warning(f"Error using langdetect: {str(e)}. Falling back to basic detection.")
-        
-        # More sophisticated fallback than just checking for English
-        # Note: This is a simplified approach - production systems should use a proper language detection library
-        
-        # Check for character sets that are distinctive to certain languages
-        # Chinese/Japanese/Korean characters
-        if re.search(r'[\u4e00-\u9fff\u3040-\u309f\u30a0-\u30ff\uac00-\ud7af]', content):
-            # Distinguish between Chinese, Japanese and Korean
-            if re.search(r'[\u3040-\u309f\u30a0-\u30ff]', content):
-                return 'ja'  # Japanese
-            elif re.search(r'[\uac00-\ud7af]', content):
-                return 'ko'  # Korean
-            else:
-                return 'zh'  # Chinese
-        
-        # Cyrillic (Russian, etc.)
-        elif re.search(r'[\u0400-\u04FF]', content):
-            return 'ru'  # Russian as default for Cyrillic
-        
-        # Arabic
-        elif re.search(r'[\u0600-\u06FF]', content):
-            return 'ar'
-        
-        # Greek
-        elif re.search(r'[\u0370-\u03FF]', content):
-            return 'el'
-        
-        # Latin-based languages - check for distinctive characters
-        elif re.search(r'[áàâäãåāăąèéêëēėęíìîïīįıóòôöõøōőúùûüūųýÿźžż]', content):
-            # This is simplified - would need more sophisticated rules to distinguish between 
-            # Spanish, French, German, etc.
-            return 'latin-script'
-        
-        # Default to English for primarily ASCII text
-        else:
-            return 'en'
+class Chunk(BaseModel):
+    text: str
+    section: str
+    type: str
+    metadata: ChunkMetadata
 
 class MultilingualMessageProcessor:
     
-    def __init__(self, models_path=None):
+    def __init__(self, es_config: Dict[str, Any], kafka_config: Dict[str, Any], model_path: Optional[str] = None):
+        """
+        Initialize the multilingual message processor with support for 70+ languages.
+        
+        Args:
+            es_config: Elasticsearch configuration.
+            kafka_config: Kafka configuration.
+            model_path: Optional path to a local SentenceTransformer model.
+        """
+        self.es_config = es_config
+        self.kafka_config = kafka_config
+        
         # Initialize SentenceTransformer with multilingual model
         model_name = 'paraphrase-multilingual-mpnet-base-v2'
-        model_path = models_path or os.path.join(os.getcwd(), 'models', 'sentence_transformer')
-        
-        # Use downloaded model if available, otherwise use the model name directly
-        if os.path.exists(model_path):
-            logger.info(f"Loading model from local path: {model_path}")
-            self.st_model = SentenceTransformer(model_path)
-        else:
-            logger.info(f"Local model not found. Loading model {model_name} from Hugging Face")
-            self.st_model = SentenceTransformer(model_name)
-        
+        try:
+            if model_path:
+                logger.info(f"Loading model from local path: {model_path}")
+                self.st_model = SentenceTransformer(model_path)
+            else:
+                logger.info(f"Loading model {model_name} from Hugging Face")
+                self.st_model = SentenceTransformer(model_name)
+        except Exception as e:
+            logger.error(f"Error loading sentence transformer model: {e}")
+            raise
+            
         # Initialize async Elasticsearch client
         self.es_client = AsyncElasticsearch(
-            ES_CONFIG['hosts'],
-            basic_auth=(ES_CONFIG.get('username', ''), ES_CONFIG.get('password', '')),
+            es_config['hosts'],
+            basic_auth=(es_config.get('username', ''), es_config.get('password', '')),
             retry_on_timeout=True,
             max_retries=3
         )
         
-        # Initialize httpx client
-        self.http_client = httpx.AsyncClient()
-        
         # Kafka configuration
         self.consumer_config = {
-            'bootstrap.servers': KAFKA_CONFIG['bootstrap_servers'],
-            'group.id': KAFKA_CONFIG['group_id'],
-            'auto.offset.reset': KAFKA_CONFIG.get('auto_offset_reset', 'earliest'),
+            'bootstrap.servers': kafka_config['bootstrap_servers'],
+            'group.id': kafka_config['group_id'],
+            'auto.offset.reset': kafka_config.get('auto_offset_reset', 'earliest'),
             'enable.auto.commit': True,
             'session.timeout.ms': 45000,
             'heartbeat.interval.ms': 15000,
@@ -212,22 +84,1161 @@ class MultilingualMessageProcessor:
         }
         
         self.producer_config = {
-            'bootstrap.servers': KAFKA_CONFIG['bootstrap_servers']
+            'bootstrap.servers': kafka_config['bootstrap_servers']
         }
         
-        # Kafka topic
-        self.topic = KAFKA_CONFIG['topic']
+        # Kafka topics
+        self.request_topic = kafka_config['vector_storage_request_topic']
+        self.response_topic = kafka_config['vector_storage_response_topic']
+        self.dlq_topic = kafka_config['vector_storage_request_dlq_topic']
         
-        # Try to download nltk data for multiple languages
-        try:
-            nltk.download('punkt', quiet=True)
-        except Exception as e:
-            logger.warning(f"Failed to download NLTK punkt: {str(e)}")
+        # Initialize Kafka producer
+        self.producer = None
 
-    async def _setup_elasticsearch_indices(self, base_index_name):
+        # Define language script groupings
+        self.SCRIPT_GROUPS = {
+            'latin': {'sl', 'pl', 'de', 'ro', 'tr', 'no', 'sv', 'pt', 'pt-br', 'hr', 
+                     'bs', 'fr', 'es', 'sk', 'it', 'nl', 'cs', 'fi', 'lt', 'da', 'hu', 
+                     'af', 'ca', 'sq', 'gl', 'en', 'en-ca', 'en-au', 'en-gb', 'et', 'lv', 'id', 'ms'},
+                     
+            'cyrillic': {'ru', 'uk', 'bg', 'mk', 'sr-cyr', 'kk'},
+            
+            'devanagari': {'hi', 'ne', 'mr'},
+            
+            'arabic': {'ar', 'fa', 'ur', 'ps'},
+            
+            'cjk': {'zh', 'zh-tw', 'ja', 'ko'},
+            
+            'thai': {'th'},
+            
+            'greek': {'el'},
+            
+            'hebrew': {'he'},
+            
+            'bengali': {'bn'},
+            
+            'dravidian': {'ta', 'te', 'kn', 'ml'},
+            
+            'gurmukhi': {'pa'},
+            
+            'gujarati': {'gu'},
+            
+            'sinhala': {'si'},
+            
+            'african': {'sw', 'ha', 'ig', 'ak', 'tw'}
+        }
+        
+        # Define sentence end markers for different script groups
+        self.SENTENCE_END_MARKERS = {
+            'latin': ['.', '!', '?', ':', ';'],
+            'cyrillic': ['.', '!', '?', ':', ';'],
+            'devanagari': ['.', '।', '!', '?'],
+            'arabic': ['.', '!', '؟', '؛', '،'],
+            'cjk': ['。', '！', '？', '：', '；', '，'],
+            'thai': ['.', '!', '?', ' '],  # Thai often uses spaces to separate sentences
+            'greek': ['.', '!', ';', ':', '·'],
+            'hebrew': ['.', '!', '?', ':', ';', '׃'],
+            'bengali': ['.', '!', '?', '।'],
+            'dravidian': ['.', '!', '?', '।'],
+            'gurmukhi': ['.', '!', '?', '।'],
+            'gujarati': ['.', '!', '?', '।'],
+            'sinhala': ['.', '!', '?', '။'],
+            'african': ['.', '!', '?', ':', ';']
+        }
+        
+        # Language-specific section headers and terms
+        self.SECTION_HEADERS = self._initialize_section_headers()
+        self.FAQ_TERMS = self._initialize_faq_terms()
+        self.POLICY_TERMS = self._initialize_policy_terms()
+        self.QA_MARKERS = self._initialize_qa_markers()
+
+    def _initialize_section_headers(self) -> Dict[str, List[str]]:
+        """Initialize section header terms for different languages"""
+        headers = {
+            # Default/English
+            'default': ['section', 'chapter', 'part'],
+            
+            # Latin script European languages
+            'de': ['abschnitt', 'kapitel', 'teil'],
+            'es': ['sección', 'capítulo', 'parte'],
+            'fr': ['section', 'chapitre', 'partie'],
+            'it': ['sezione', 'capitolo', 'parte'],
+            'pt': ['seção', 'capítulo', 'parte'],
+            'nl': ['sectie', 'hoofdstuk', 'deel'],
+            'pl': ['sekcja', 'rozdział', 'część'],
+            'ro': ['secțiune', 'capitol', 'parte'],
+            'sv': ['avsnitt', 'kapitel', 'del'],
+            'no': ['avsnitt', 'kapittel', 'del'],
+            'da': ['afsnit', 'kapitel', 'del'],
+            'fi': ['osio', 'luku', 'osa'],
+            'hu': ['szakasz', 'fejezet', 'rész'],
+            'cs': ['sekce', 'kapitola', 'část'],
+            'sk': ['sekcia', 'kapitola', 'časť'],
+            'sl': ['razdelek', 'poglavje', 'del'],
+            'hr': ['odjeljak', 'poglavlje', 'dio'],
+            'bs': ['odjeljak', 'poglavlje', 'dio'],
+            'ca': ['secció', 'capítol', 'part'],
+            'gl': ['sección', 'capítulo', 'parte'],
+            'tr': ['bölüm', 'kısım', 'parça'],
+            
+            # Cyrillic script languages
+            'ru': ['раздел', 'глава', 'часть'],
+            'uk': ['розділ', 'глава', 'частина'],
+            'bg': ['раздел', 'глава', 'част'],
+            'mk': ['дел', 'глава', 'поглавје'],
+            'sr-cyr': ['одељак', 'поглавље', 'део'],
+            'kk': ['бөлім', 'тарау', 'бөлік'],
+            
+            # Hindi and other Indic languages
+            'hi': ['अनुभाग', 'अध्याय', 'भाग'],
+            'mr': ['विभाग', 'अध्याय', 'भाग'],
+            'ne': ['खण्ड', 'अध्याय', 'भाग'],
+            'bn': ['বিভাগ', 'অধ্যায়', 'অংশ'],
+            'pa': ['ਸੈਕਸ਼ਨ', 'ਅਧਿਆਇ', 'ਭਾਗ'],
+            'gu': ['વિભાગ', 'અધ્યાય', 'ભાગ'],
+            'si': ['කොටස', 'පරිච්ඡේදය', 'කොටස'],
+            'ta': ['பிரிவு', 'அத்தியாயம்', 'பகுதி'],
+            'te': ['విభాగం', 'అధ్యాయం', 'భాగం'],
+            'kn': ['ವಿಭಾಗ', 'ಅಧ್ಯಾಯ', 'ಭಾಗ'],
+            'ml': ['വിഭാഗം', 'അധ്യായം', 'ഭാഗം'],
+            
+            # Middle Eastern languages
+            'ar': ['قسم', 'فصل', 'جزء'],
+            'fa': ['بخش', 'فصل', 'قسمت'],
+            'ur': ['سیکشن', 'باب', 'حصہ'],
+            'ps': ['برخه', 'څپرکی', 'برخه'],
+            'he': ['חלק', 'פרק', 'סעיף'],
+            
+            # East Asian languages
+            'zh': ['部分', '章节', '节'],
+            'zh-tw': ['部分', '章節', '節'],
+            'ja': ['セクション', '章', '部'],
+            'ko': ['섹션', '장', '부분'],
+            
+            # Thai
+            'th': ['ส่วน', 'บท', 'ตอน'],
+            
+            # Greek
+            'el': ['τμήμα', 'κεφάλαιο', 'μέρος'],
+            
+            # Indonesian and Malay
+            'id': ['bagian', 'bab', 'bagian'],
+            'ms': ['bahagian', 'bab', 'bahagian'],
+            
+            # Vietnamese
+            'vi': ['phần', 'chương', 'mục'],
+            
+            # African languages
+            'sw': ['sehemu', 'sura', 'sehemu'],
+            'ha': ['sashe', 'babi', 'bangare'],
+            'ig': ['nkeji', 'isi', 'akụkụ']
+        }
+        return headers
+
+    def _initialize_faq_terms(self) -> Dict[str, List[str]]:
+        """Initialize FAQ-related terms for different languages"""
+        terms = {
+            # Default/English
+            'default': ['faq', 'frequently asked questions', 'questions and answers', 'q&a'],
+            
+            # Latin script European languages
+            'de': ['faq', 'häufig gestellte fragen', 'fragen und antworten'],
+            'es': ['preguntas frecuentes', 'faq', 'preguntas y respuestas'],
+            'fr': ['faq', 'foire aux questions', 'questions fréquemment posées'],
+            'it': ['faq', 'domande frequenti', 'domande e risposte'],
+            'pt': ['faq', 'perguntas frequentes', 'perguntas e respostas'],
+            'nl': ['faq', 'veelgestelde vragen', 'vragen en antwoorden'],
+            'pl': ['faq', 'często zadawane pytania', 'pytania i odpowiedzi'],
+            'ro': ['întrebări frecvente', 'întrebări și răspunsuri'],
+            'sv': ['faq', 'vanliga frågor', 'frågor och svar'],
+            'no': ['faq', 'ofte stilte spørsmål', 'spørsmål og svar'],
+            'da': ['faq', 'ofte stillede spørgsmål', 'spørgsmål og svar'],
+            'fi': ['ukk', 'usein kysytyt kysymykset', 'kysymykset ja vastaukset'],
+            'hu': ['gyik', 'gyakran ismételt kérdések', 'kérdések és válaszok'],
+            'cs': ['často kladené dotazy', 'otázky a odpovědi'],
+            'sk': ['často kladené otázky', 'otázky a odpovede'],
+            'sl': ['pogosta vprašanja', 'vprašanja in odgovori'],
+            'hr': ['često postavljana pitanja', 'pitanja i odgovori'],
+            'bs': ['često postavljana pitanja', 'pitanja i odgovori'],
+            'tr': ['sss', 'sıkça sorulan sorular', 'sorular ve cevaplar'],
+            
+            # Cyrillic script languages
+            'ru': ['часто задаваемые вопросы', 'вопросы и ответы'],
+            'uk': ['часті запитання', 'питання та відповіді'],
+            'bg': ['често задавани въпроси', 'въпроси и отговори'],
+            'mk': ['често поставувани прашања', 'прашања и одговори'],
+            'sr-cyr': ['често постављана питања', 'питања и одговори'],
+            
+            # Hindi and other Indic languages
+            'hi': ['अक्सर पूछे जाने वाले प्रश्न', 'प्रश्न और उत्तर'],
+            'mr': ['वारंवार विचारले जाणारे प्रश्न', 'प्रश्न आणि उत्तरे'],
+            'ne': ['बारम्बार सोधिने प्रश्नहरू', 'प्रश्न र उत्तरहरू'],
+            'bn': ['সচরাচর জিজ্ঞাসিত প্রশ্নাবলী', 'প্রশ্ন ও উত্তর'],
+            'pa': ['ਅਕਸਰ ਪੁੱਛੇ ਜਾਣ ਵਾਲੇ ਸਵਾਲ', 'ਸਵਾਲ ਅਤੇ ਜਵਾਬ'],
+            'gu': ['વારંવાર પૂછાતા પ્રશ્નો', 'પ્રશ્નો અને જવાબો'],
+            'si': ['නිතර අසන ප්‍රශ්න', 'ප්‍රශ්න සහ පිළිතුරු'],
+            'ta': ['அடிக்கடி கேட்கப்படும் கேள்விகள்', 'கேள்விகள் மற்றும் பதில்கள்'],
+            'te': ['తరచుగా అడిగే ప్రశ్నలు', 'ప్రశ్నలు మరియు సమాధానాలు'],
+            'kn': ['ಪದೇ ಪದೇ ಕೇಳಲಾಗುವ ಪ್ರಶ್ನೆಗಳು', 'ಪ್ರಶ್ನೆಗಳು ಮತ್ತು ಉತ್ತರಗಳು'],
+            'ml': ['പതിവായി ചോദിക്കുന്ന ചോദ്യങ്ങൾ', 'ചോദ്യങ്ങളും ഉത്തരങ്ങളും'],
+            
+            # Middle Eastern languages
+            'ar': ['الأسئلة الشائعة', 'الأسئلة المتكررة', 'أسئلة وأجوبة'],
+            'fa': ['سوالات متداول', 'پرسش و پاسخ'],
+            'ur': ['اکثر پوچھے گئے سوالات', 'سوال و جواب'],
+            'ps': ['تل پوښتل شوي پوښتنې', 'پوښتنې او ځوابونه'],
+            'he': ['שאלות נפוצות', 'שאלות ותשובות'],
+            
+            # East Asian languages
+            'zh': ['常见问题', '常见问答', '问答'],
+            'zh-tw': ['常見問題', '常見問答', '問答'],
+            'ja': ['よくある質問', 'よくあるご質問', '質問と回答'],
+            'ko': ['자주 묻는 질문', '질문과 답변'],
+            
+            # Thai
+            'th': ['คำถามที่พบบ่อย', 'คำถามและคำตอบ'],
+            
+            # Greek
+            'el': ['συχνές ερωτήσεις', 'ερωτήσεις και απαντήσεις'],
+            
+            # Indonesian and Malay
+            'id': ['faq', 'pertanyaan yang sering diajukan', 'tanya jawab'],
+            'ms': ['soalan lazim', 'soalan dan jawapan'],
+            
+            # Vietnamese
+            'vi': ['câu hỏi thường gặp', 'hỏi đáp'],
+            
+            # African languages
+            'sw': ['maswali yanayoulizwa mara kwa mara', 'maswali na majibu'],
+            'ha': ['tambayoyin da ake yawan yi', 'tambayoyi da amsa'],
+            'ig': ['ajụjụ ana-ajụkarị', 'ajụjụ na azịza']
+        }
+        return terms
+
+    def _initialize_policy_terms(self) -> Dict[str, List[str]]:
+        """Initialize policy-related terms for different languages"""
+        terms = {
+            # Default/English
+            'default': ['policy', 'terms', 'conditions', 'agreement', 'privacy', 'legal'],
+            
+            # Latin script European languages
+            'de': ['richtlinie', 'bedingungen', 'vereinbarung', 'datenschutz', 'rechtlich'],
+            'es': ['política', 'términos', 'condiciones', 'acuerdo', 'privacidad', 'legal'],
+            'fr': ['politique', 'conditions', 'accord', 'confidentialité', 'légal'],
+            'it': ['politica', 'termini', 'condizioni', 'accordo', 'privacy', 'legale'],
+            'pt': ['política', 'termos', 'condições', 'acordo', 'privacidade', 'legal'],
+            'nl': ['beleid', 'voorwaarden', 'overeenkomst', 'privacy', 'juridisch'],
+            'pl': ['polityka', 'warunki', 'umowa', 'prywatność', 'prawny'],
+            'ro': ['politică', 'termeni', 'condiții', 'acord', 'confidențialitate', 'legal'],
+            'sv': ['policy', 'villkor', 'avtal', 'integritet', 'juridiskt'],
+            'no': ['retningslinjer', 'vilkår', 'avtale', 'personvern', 'juridisk'],
+            'da': ['politik', 'vilkår', 'betingelser', 'aftale', 'privatlivspolitik', 'juridisk'],
+            'fi': ['käytäntö', 'ehdot', 'sopimus', 'yksityisyys', 'laillinen'],
+            'hu': ['szabályzat', 'feltételek', 'megállapodás', 'adatvédelem', 'jogi'],
+            'cs': ['zásady', 'podmínky', 'smlouva', 'soukromí', 'právní'],
+            'sk': ['zásady', 'podmienky', 'dohoda', 'súkromie', 'právne'],
+            'sl': ['politika', 'pogoji', 'sporazum', 'zasebnost', 'pravno'],
+            'hr': ['politika', 'uvjeti', 'ugovor', 'privatnost', 'pravno'],
+            'bs': ['politika', 'uslovi', 'sporazum', 'privatnost', 'pravno'],
+            'tr': ['politika', 'şartlar', 'koşullar', 'anlaşma', 'gizlilik', 'yasal'],
+            
+            # Cyrillic script languages
+            'ru': ['политика', 'условия', 'соглашение', 'конфиденциальность', 'правовой'],
+            'uk': ['політика', 'умови', 'угода', 'конфіденційність', 'правовий'],
+            'bg': ['политика', 'условия', 'споразумение', 'поверителност', 'правен'],
+            'mk': ['политика', 'услови', 'договор', 'приватност', 'правно'],
+            'sr-cyr': ['политика', 'услови', 'уговор', 'приватност', 'правно'],
+            
+            # Hindi and other Indic languages
+            'hi': ['नीति', 'शर्तें', 'समझौता', 'गोपनीयता', 'कानूनी'],
+            'mr': ['धोरण', 'अटी', 'करार', 'गोपनीयता', 'कायदेशीर'],
+            'ne': ['नीति', 'सर्तहरू', 'सम्झौता', 'गोपनीयता', 'कानूनी'],
+            'bn': ['নীতি', 'শর্তাবলী', 'চুক্তি', 'গোপনীয়তা', 'আইনি'],
+            'pa': ['ਨੀਤੀ', 'ਸ਼ਰਤਾਂ', 'ਸਮਝੌਤਾ', 'ਗੋਪਨੀਯਤਾ', 'ਕਾਨੂੰਨੀ'],
+            'gu': ['નીતિ', 'શરતો', 'કરાર', 'ગોપનીયતા', 'કાનૂની'],
+            'si': ['ප්‍රතිපත්තිය', 'කොන්දේසි', 'ගිවිසුම', 'පුද්ගලිකත්වය', 'නීතිමය'],
+            'ta': ['கொள்கை', 'விதிமுறைகள்', 'ஒப்பந்தம்', 'தனியுரிமை', 'சட்டப்பூர்வ'],
+            'te': ['విధానం', 'నిబంధనలు', 'ఒప్పందం', 'గోప్యత', 'చట్టపరమైన'],
+            'kn': ['ನೀತಿ', 'ನಿಯಮಗಳು', 'ಒಪ್ಪಂದ', 'ಗೌಪ್ಯತೆ', 'ಕಾನೂನು'],
+            'ml': ['നയം', 'നിബന്ധനകൾ', 'കരാർ', 'സ്വകാര്യത', 'നിയമപരമായ'],
+            
+            # Middle Eastern languages
+            'ar': ['سياسة', 'شروط', 'اتفاقية', 'خصوصية', 'قانوني'],
+            'fa': ['سیاست', 'شرایط', 'توافق', 'حریم خصوصی', 'قانونی'],
+            'ur': ['پالیسی', 'شرائط', 'معاہدہ', 'رازداری', 'قانونی'],
+            'ps': ['تګلاره', 'شرایط', 'تړون', 'محرمیت', 'قانوني'],
+            'he': ['מדיניות', 'תנאים', 'הסכם', 'פרטיות', 'משפטי'],
+            
+            # East Asian languages
+            'zh': ['政策', '条款', '协议', '隐私', '法律'],
+            'zh-tw': ['政策', '條款', '協議', '隱私', '法律'],
+            'ja': ['ポリシー', '規約', '契約', 'プライバシー', '法的'],
+            'ko': ['정책', '약관', '계약', '개인정보', '법적'],
+            
+            # Thai
+            'th': ['นโยบาย', 'เงื่อนไข', 'ข้อตกลง', 'ความเป็นส่วนตัว', 'ทางกฎหมาย'],
+            
+            # Greek
+            'el': ['πολιτική', 'όροι', 'συμφωνία', 'απόρρητο', 'νομικό'],
+            
+            # Indonesian and Malay
+            'id': ['kebijakan', 'syarat', 'ketentuan', 'perjanjian', 'privasi', 'hukum'],
+            'ms': ['dasar', 'terma', 'syarat', 'perjanjian', 'privasi', 'undang-undang'],
+            
+            # Vietnamese
+            'vi': ['chính sách', 'điều khoản', 'thỏa thuận', 'quyền riêng tư', 'pháp lý'],
+            
+            # African languages
+            'sw': ['sera', 'masharti', 'makubaliano', 'faragha', 'kisheria'],
+            'ha': ['manufa', 'sharuɗɗa', 'yarjejeniya', 'sirri', 'na doka'],
+            'ig': ['iwu', 'usoro', 'nkwekọrịta', 'nzuzo', 'iwu']
+        }
+        return terms
+
+    def _initialize_qa_markers(self) -> Dict[str, List[Tuple[str, str]]]:
+        """Initialize Q&A markers for different languages"""
+        markers = {
+            # Default/English
+            'default': [('Q', 'A'), ('Question', 'Answer')],
+            
+            # Latin script European languages
+            'de': [('F', 'A'), ('Frage', 'Antwort')],
+            'es': [('P', 'R'), ('Pregunta', 'Respuesta')],
+            'fr': [('Q', 'R'), ('Question', 'Réponse')],
+            'it': [('D', 'R'), ('Domanda', 'Risposta')],
+            'pt': [('P', 'R'), ('Pergunta', 'Resposta')],
+            'nl': [('V', 'A'), ('Vraag', 'Antwoord')],
+            'pl': [('P', 'O'), ('Pytanie', 'Odpowiedź')],
+            'ro': [('Î', 'R'), ('Întrebare', 'Răspuns')],
+            'sv': [('F', 'S'), ('Fråga', 'Svar')],
+            'no': [('S', 'S'), ('Spørsmål', 'Svar')],
+            'da': [('S', 'S'), ('Spørgsmål', 'Svar')],
+            'fi': [('K', 'V'), ('Kysymys', 'Vastaus')],
+            'hu': [('K', 'V'), ('Kérdés', 'Válasz')],
+            'cs': [('O', 'O'), ('Otázka', 'Odpověď')],
+            'sk': [('O', 'O'), ('Otázka', 'Odpoveď')],
+            'sl': [('V', 'O'), ('Vprašanje', 'Odgovor')],
+            'hr': [('P', 'O'), ('Pitanje', 'Odgovor')],
+            'bs': [('P', 'O'), ('Pitanje', 'Odgovor')],
+            'tr': [('S', 'C'), ('Soru', 'Cevap')],
+            
+            # Cyrillic script languages
+            'ru': [('В', 'О'), ('Вопрос', 'Ответ')],
+            'uk': [('П', 'В'), ('Питання', 'Відповідь')],
+            'bg': [('В', 'О'), ('Въпрос', 'Отговор')],
+            'mk': [('П', 'О'), ('Прашање', 'Одговор')],
+            'sr-cyr': [('П', 'О'), ('Питање', 'Одговор')],
+            'kk': [('С', 'Ж'), ('Сұрақ', 'Жауап')],
+            
+            # Hindi and other Indic languages
+            'hi': [('प्र', 'उ'), ('प्रश्न', 'उत्तर'), ('सवाल', 'जवाब')],
+            'mr': [('प्र', 'उ'), ('प्रश्न', 'उत्तर')],
+            'ne': [('प्र', 'उ'), ('प्रश्न', 'उत्तर')],
+            'bn': [('প্র', 'উ'), ('প্রশ্ন', 'উত্তর')],
+            'pa': [('ਸ', 'ਜ'), ('ਸਵਾਲ', 'ਜਵਾਬ')],
+            'gu': [('પ્ર', 'ઉ'), ('પ્રશ્ન', 'ઉત્તર')],
+            'si': [('ප්‍ර', 'පි'), ('ප්‍රශ්නය', 'පිළිතුර')],
+            'ta': [('கே', 'ப'), ('கேள்வி', 'பதில்')],
+            'te': [('ప్ర', 'జ'), ('ప్రశ్న', 'జవాబు')],
+            'kn': [('ಪ್ರ', 'ಉ'), ('ಪ್ರಶ್ನೆ', 'ಉತ್ತರ')],
+            'ml': [('ചോ', 'ഉ'), ('ചോദ്യം', 'ഉത്തരം')],
+            
+            # Middle Eastern languages
+            'ar': [('س', 'ج'), ('سؤال', 'جواب')],
+            'fa': [('س', 'ج'), ('سوال', 'جواب')],
+            'ur': [('س', 'ج'), ('سوال', 'جواب')],
+            'ps': [('پ', 'ځ'), ('پوښتنه', 'ځواب')],
+            'he': [('ש', 'ת'), ('שאלה', 'תשובה')],
+            
+            # East Asian languages
+            'zh': [('问', '答'), ('问题', '回答'), ('Q', 'A')],
+            'zh-tw': [('問', '答'), ('問題', '回答'), ('Q', 'A')],
+            'ja': [('質問', '回答'), ('問', '答'), ('Q', 'A')],
+            'ko': [('질문', '답변'), ('문', '답'), ('Q', 'A')],
+            
+            # Thai
+            'th': [('คำถาม', 'คำตอบ'), ('ถาม', 'ตอบ'), ('Q', 'A')],
+            
+            # Greek
+            'el': [('Ε', 'Α'), ('Ερώτηση', 'Απάντηση')],
+            
+            # Indonesian and Malay
+            'id': [('T', 'J'), ('Tanya', 'Jawab')],
+            'ms': [('S', 'J'), ('Soalan', 'Jawapan')],
+            
+            # Vietnamese
+            'vi': [('H', 'Đ'), ('Hỏi', 'Đáp')],
+            
+            # African languages
+            'sw': [('S', 'J'), ('Swali', 'Jibu')],
+            'ha': [('T', 'A'), ('Tambaya', 'Amsa')],
+            'ig': [('A', 'A'), ('Ajụjụ', 'Azịza')]
+        }
+        return markers
+
+    def get_script_group(self, language: str) -> str:
+        """
+        Get the script group for a language.
+        
+        Args:
+            language: Language code
+            
+        Returns:
+            Script group name
+        """
+        for group, langs in self.SCRIPT_GROUPS.items():
+            if language in langs:
+                return group
+        return 'latin'  # Default to Latin script
+
+    def get_sentence_end_markers(self, language: str) -> List[str]:
+        """
+        Get sentence end markers for a language.
+        
+        Args:
+            language: Language code
+            
+        Returns:
+            List of end markers
+        """
+        script_group = self.get_script_group(language)
+        return self.SENTENCE_END_MARKERS.get(script_group, self.SENTENCE_END_MARKERS['latin'])
+
+    def get_section_headers(self, language: str) -> List[str]:
+        """
+        Get section header terms for a language.
+        
+        Args:
+            language: Language code
+            
+        Returns:
+            List of section header terms
+        """
+        return self.SECTION_HEADERS.get(language, self.SECTION_HEADERS['default'])
+
+    def get_faq_terms(self, language: str) -> List[str]:
+        """
+        Get FAQ-related terms for a language.
+        
+        Args:
+            language: Language code
+            
+        Returns:
+            List of FAQ terms
+        """
+        return self.FAQ_TERMS.get(language, self.FAQ_TERMS['default'])
+
+    def get_policy_terms(self, language: str) -> List[str]:
+        """
+        Get policy-related terms for a language.
+        
+        Args:
+            language: Language code
+            
+        Returns:
+            List of policy terms
+        """
+        return self.POLICY_TERMS.get(language, self.POLICY_TERMS['default'])
+
+    def get_qa_markers(self, language: str) -> List[Tuple[str, str]]:
+        """
+        Get Q&A markers for a language.
+        
+        Args:
+            language: Language code
+            
+        Returns:
+            List of (question_marker, answer_marker) tuples
+        """
+        return self.QA_MARKERS.get(language, self.QA_MARKERS['default'])
+
+    def detect_language(self, text: str) -> str:
+        """
+        Language detection with support for 70+ languages.
+        
+        Args:
+            text: Text to detect language for
+            
+        Returns:
+            ISO language code
+        """
+        try:
+            from langdetect import detect, DetectorFactory
+            # Set seed for deterministic results
+            DetectorFactory.seed = 0
+            return detect(text)
+        except (ImportError, Exception) as e:
+            logger.warning(f"Error using langdetect: {str(e)}. Falling back to script-based detection.")
+            
+            # Script-based detection for non-Latin scripts
+            # Devanagari (Hindi, Marathi, Nepali)
+            if re.search(r'[\u0900-\u097F]', text):
+                return 'hi'  # Default to Hindi
+                
+            # Bengali
+            if re.search(r'[\u0980-\u09FF]', text):
+                return 'bn'
+                
+            # Gurmukhi (Punjabi)
+            if re.search(r'[\u0A00-\u0A7F]', text):
+                return 'pa'
+                
+            # Gujarati
+            if re.search(r'[\u0A80-\u0AFF]', text):
+                return 'gu'
+                
+            # Tamil
+            if re.search(r'[\u0B80-\u0BFF]', text):
+                return 'ta'
+                
+            # Telugu
+            if re.search(r'[\u0C00-\u0C7F]', text):
+                return 'te'
+                
+            # Kannada
+            if re.search(r'[\u0C80-\u0CFF]', text):
+                return 'kn'
+                
+            # Malayalam
+            if re.search(r'[\u0D00-\u0D7F]', text):
+                return 'ml'
+                
+            # Sinhala
+            if re.search(r'[\u0D80-\u0DFF]', text):
+                return 'si'
+                
+            # Thai
+            if re.search(r'[\u0E00-\u0E7F]', text):
+                return 'th'
+                
+            # Cyrillic
+            if re.search(r'[\u0400-\u04FF]', text):
+                # Try to distinguish between Cyrillic languages
+                if re.search(r'[ії]', text):
+                    return 'uk'  # Ukrainian
+                elif re.search(r'[ђљњ]', text):
+                    return 'sr-cyr'  # Serbian Cyrillic
+                else:
+                    return 'ru'  # Default to Russian
+                
+            # Greek
+            if re.search(r'[\u0370-\u03FF]', text):
+                return 'el'
+                
+            # Hebrew
+            if re.search(r'[\u0590-\u05FF]', text):
+                return 'he'
+                
+            # Arabic
+            if re.search(r'[\u0600-\u06FF]', text):
+                # Try to distinguish between Arabic script languages
+                if re.search(r'[پچژگ]', text):
+                    return 'fa'  # Persian
+                elif re.search(r'[ٹڈڑں]', text):
+                    return 'ur'  # Urdu
+                else:
+                    return 'ar'  # Default to Arabic
+                
+            # CJK (Chinese, Japanese, Korean)
+            if re.search(r'[\u3040-\u30FF]', text):
+                return 'ja'  # Japanese-specific characters
+            elif re.search(r'[\uAC00-\uD7AF]', text):
+                return 'ko'  # Korean-specific characters
+            elif re.search(r'[\u4E00-\u9FFF]', text):
+                return 'zh'  # Default to Chinese for general CJK
+                
+            # Default to English for primarily Latin script
+            return 'en'
+
+    def detect_document_type(self, text: str, language: str) -> str:
+        """
+        Detect document type based on content and language-specific indicators.
+        
+        Args:
+            text: Document text
+            language: Language code
+            
+        Returns:
+            Document type: 'faq', 'policy', 'history', 'general'
+        """
+        text_lower = text.lower()
+        
+        # Check for FAQ indicators in the appropriate language
+        faq_terms = self.get_faq_terms(language)
+        if any(term in text_lower for term in faq_terms):
+            return 'faq'
+        
+        # Count question marks or language-specific question indicators
+        script_group = self.get_script_group(language)
+        if script_group == 'cjk':
+            question_count = len(re.findall(r'[?？]', text))
+        elif script_group == 'arabic':
+            question_count = len(re.findall(r'[?؟]', text))
+        else:
+            question_count = len(re.findall(r'\?', text))
+            
+        if question_count > 3:
+            return 'faq'
+        
+        # Check for policy document indicators
+        policy_terms = self.get_policy_terms(language)
+        if any(term in text_lower for term in policy_terms):
+            return 'policy'
+        
+        # Check for numbered sections which are common in policies
+        # Adapt regex for script groups that use different numbering systems
+        if script_group == 'cjk':
+            # Using Chinese/Japanese numbering
+            numbered_pattern = r'[一二三四五六七八九十][\s、．\.]'
+        elif script_group in ['devanagari', 'bengali', 'gurmukhi', 'gujarati', 'dravidian']:
+            # Using Indic numbering or Latin numbers
+            numbered_pattern = r'(?:\d+|[१२३४५६७८९०]+)[\s\.\-\)]'
+        elif script_group == 'arabic':
+            # Arabic numerals or Arabic-Indic numerals
+            numbered_pattern = r'(?:\d+|[١٢٣٤٥٦٧٨٩٠]+)[\s\.\-\)]'
+        else:
+            # Default Latin numbering
+            numbered_pattern = r'\d+[\s\.\-\)]'
+            
+        numbered_sections = re.findall(numbered_pattern, text)
+        if len(numbered_sections) > 3:
+            return 'policy'
+        
+        # Default to general content
+        return 'general'
+
+    def split_into_sentences(self, text: str, language: str) -> List[str]:
+        """
+        Split text into sentences with language-specific rules.
+        
+        Args:
+            text: Text to split
+            language: Language code
+            
+        Returns:
+            List of sentences
+        """
+        # Try to use NLTK if available for supported languages
+        try:
+            import nltk
+            nltk_supported = ['en', 'es', 'fr', 'de', 'it', 'nl', 'pt']
+            
+            if language in nltk_supported:
+                try:
+                    return nltk.sent_tokenize(text, language)
+                except (ImportError, LookupError):
+                    pass  # Fall back to regex
+        except ImportError:
+            pass
+        
+        # Get script group and sentence markers for this language
+        script_group = self.get_script_group(language)
+        end_markers = self.get_sentence_end_markers(language)
+        
+        # Escape special regex characters
+        escaped_markers = [re.escape(marker) for marker in end_markers]
+        
+        # Different splitting strategy based on script group
+        if script_group == 'cjk':
+            # For CJK languages, don't require spaces after punctuation
+            pattern = f"([{''.join(escaped_markers)}])"
+            parts = re.split(pattern, text)
+            
+            # Recombine parts (text + punctuation)
+            sentences = []
+            current = ""
+            for i, part in enumerate(parts):
+                if i % 2 == 0:  # Text
+                    current += part
+                else:  # Punctuation
+                    current += part
+                    if current.strip():
+                        sentences.append(current.strip())
+                    current = ""
+            
+            # Add any remaining text
+            if current.strip():
+                sentences.append(current.strip())
+                
+            return sentences
+            
+        elif script_group == 'thai':
+            # For Thai, split on specific punctuation or double spaces (common separator)
+            pattern = f"(?<=[{''.join(escaped_markers)}])|(?<=\\s\\s)"
+            return [s.strip() for s in re.split(pattern, text) if s.strip()]
+            
+        else:
+            # For other scripts, assume punctuation followed by space
+            pattern = f"(?<=[{''.join(escaped_markers)}])\\s+"
+            sentences = re.split(pattern, text)
+            
+            # If we got very few sentences, try a less strict pattern
+            if len(sentences) <= 1 and len(text) > 200:
+                pattern = f"(?<=[{''.join(escaped_markers)}])"
+                sentences = re.split(pattern, text)
+            
+            return [s.strip() for s in sentences if s.strip()]
+
+    def identify_document_sections(self, text: str, language: str) -> List[Tuple[str, str]]:
+        """
+        Identify document sections with language-specific patterns.
+        
+        Args:
+            text: Document text
+            language: Language code
+            
+        Returns:
+            List of (section_title, section_content) tuples
+        """
+        script_group = self.get_script_group(language)
+        
+        # Try Markdown-style headers first (universal format)
+        markdown_patterns = [
+            # Level 2 headers with content
+            (r'(?:^|\n)##\s+(.*?)(?:\n|$)((?:.|\n)*?)(?=\n##|\Z)', True),
+            # Level 1 headers with content
+            (r'(?:^|\n)#\s+(.*?)(?:\n|$)((?:.|\n)*?)(?=\n#|\Z)', True)
+        ]
+        
+        for pattern, is_full_match in markdown_patterns:
+            matches = re.finditer(pattern, text, re.MULTILINE | re.DOTALL)
+            sections = [(m.group(1).strip(), m.group(2).strip()) for m in matches]
+            if sections:
+                return sections
+        
+        # Try language-specific section headers
+        section_terms = self.get_section_headers(language)
+        
+        # Create patterns for each section term
+        section_patterns = []
+        for term in section_terms:
+            if script_group in ['latin', 'cyrillic', 'greek']:
+                # For Latin/Cyrillic/Greek scripts, look for capitalized headers
+                pattern = rf'(?:^|\n)(?:{term}|{term.capitalize()})\s*\d*[\.\:]\s*(.*?)(?:\n|$)'
+                section_patterns.append(pattern)
+            else:
+                # For other scripts, just look for the term
+                pattern = rf'(?:^|\n){term}\s*\d*[\.\:]\s*(.*?)(?:\n|$)'
+                section_patterns.append(pattern)
+        
+        # Also include numbered headers
+        if script_group == 'cjk':
+            # CJK numbering
+            numbered_header = r'(?:^|\n)(?:[一二三四五六七八九十]+[\.．、]|[0-9]+[\.．、])\s*([^\n]+)'
+        elif script_group in ['devanagari', 'bengali', 'dravidian', 'gurmukhi', 'gujarati']:
+            # Indic numbering or Latin numbers
+            numbered_header = r'(?:^|\n)(?:\d+[\.।]|[१२३४५६७८९०]+[\.।])\s*([^\n]+)'
+        elif script_group == 'arabic':
+            # Arabic/Persian numbering
+            numbered_header = r'(?:^|\n)(?:\d+[\.،]|[١٢٣٤٥٦٧٨٩٠]+[\.،])\s*([^\n]+)'
+        else:
+            # Default Latin numbering
+            numbered_header = r'(?:^|\n)\d+[\.]\s*([^\n]+)'
+            
+        section_patterns.append(numbered_header)
+        
+        # Try to find sections using the patterns
+        for pattern in section_patterns:
+            headers = re.finditer(pattern, text)
+            header_positions = [(m.start(), m.group(1).strip()) for m in headers]
+            
+            if len(header_positions) > 0:
+                sections = []
+                for i in range(len(header_positions)):
+                    start_pos, header = header_positions[i]
+                    end_pos = header_positions[i+1][0] if i+1 < len(header_positions) else len(text)
+                    
+                    # Extract the section content, excluding the header itself
+                    header_line_end = text.find('\n', start_pos + 1)
+                    if header_line_end == -1:
+                        header_line_end = len(text)
+                    
+                    content = text[header_line_end:end_pos].strip()
+                    sections.append((header, content))
+                    
+                if sections:
+                    return sections
+        
+        # If no sections found, look for visual separators
+        separator_patterns = [
+            r'\n-{3,}\n',  # Markdown-style separators
+            r'\n\*{3,}\n',  # Asterisk separators
+            r'\n={3,}\n',   # Equals separators
+            r'\n\n\n+'      # Multiple blank lines
+        ]
+        
+        for pattern in separator_patterns:
+            parts = re.split(pattern, text)
+            if len(parts) > 1:
+                sections = []
+                for part in parts:
+                    part = part.strip()
+                    if not part:
+                        continue
+                    
+                    # Try to use the first line as a header
+                    lines = part.split('\n')
+                    if len(lines) > 1 and len(lines[0].strip()) < 100:  # Reasonable header length
+                        header = lines[0].strip()
+                        content = '\n'.join(lines[1:]).strip()
+                        sections.append((header, content))
+                    else:
+                        # No clear header, use "Section N"
+                        sections.append((f"Section {len(sections)+1}", part))
+                        
+                if sections:
+                    return sections
+        
+        # If still no sections, just return the whole text as one section
+        return [("General", text)]
+
+    def extract_qa_pairs(self, text: str, language: str) -> List[Tuple[str, str]]:
+        """
+        Extract question-answer pairs with language-specific patterns.
+        
+        Args:
+            text: Document text
+            language: Language code
+            
+        Returns:
+            List of (question, answer) tuples
+        """
+        qa_pairs = []
+        
+        # Try explicit Q&A format with language-specific markers
+        qa_markers = self.get_qa_markers(language)
+        
+        for q_marker, a_marker in qa_markers:
+            # Try variations with different separators
+            for separator in [':', '.', ' ']:
+                q_pattern = f"{q_marker}{separator}"
+                a_pattern = f"{a_marker}{separator}"
+                
+                # Pattern for "Q: question\nA: answer"
+                pattern = rf'(?:^|\n)\s*{re.escape(q_pattern)}\s*(.*?)(?:\n|\r\n?)\s*{re.escape(a_pattern)}\s*(.*?)(?=\n\s*{re.escape(q_pattern)}|\Z)'
+                
+                matches = re.finditer(pattern, text, re.DOTALL | re.IGNORECASE)
+                for match in matches:
+                    question = match.group(1).strip()
+                    answer = match.group(2).strip()
+                    
+                    if question and answer:
+                        qa_pairs.append((question, answer))
+        
+        # If no explicit Q&A pairs found, try numbered format
+        if not qa_pairs:
+            # Adapt pattern based on script group
+            script_group = self.get_script_group(language)
+            
+            if script_group == 'cjk':
+                # For CJK, look for numbered questions with CJK or Arabic numerals
+                pattern = r'(?:^|\n)\s*(?:\d+|[一二三四五六七八九十]+)[\.．、]?\s*([^？？\n]*[？？])\s*(.*?)(?=\n\s*(?:\d+|[一二三四五六七八九十]+)[\.．、]|\Z)'
+            elif script_group in ['devanagari', 'bengali', 'dravidian', 'gurmukhi', 'gujarati']:
+                # For Indic scripts
+                pattern = r'(?:^|\n)\s*(?:\d+|[१२३४५६७८९०]+)[\.।]?\s*([^\n]*\?)\s*(.*?)(?=\n\s*(?:\d+|[१२३४५६७८९०]+)[\.।]|\Z)'
+            elif script_group == 'arabic':
+                # For Arabic script
+                pattern = r'(?:^|\n)\s*(?:\d+|[١٢٣٤٥٦٧٨٩٠]+)[\.،]?\s*([^\n]*[\?؟])\s*(.*?)(?=\n\s*(?:\d+|[١٢٣٤٥٦٧٨٩٠]+)[\.،]|\Z)'
+            else:
+                # Default pattern for Latin script and others
+                pattern = r'(?:^|\n)\s*\d+\.?\s*([^\n]*\??)\s*(.*?)(?=\n\s*\d+\.|\Z)'
+                
+            matches = re.finditer(pattern, text, re.DOTALL)
+            for match in matches:
+                question = match.group(1).strip()
+                answer = match.group(2).strip()
+                
+                # Verify it looks like a question (has ? or ends with question mark in appropriate script)
+                is_question = False
+                if '?' in question:
+                    is_question = True
+                elif script_group == 'cjk' and ('？' in question):
+                    is_question = True
+                elif script_group == 'arabic' and ('؟' in question):
+                    is_question = True
+                
+                if is_question and question and answer:
+                    qa_pairs.append((question, answer))
+        
+        return qa_pairs
+
+    def extract_chunks(self, text: str, language: str) -> List[Chunk]:
+        """
+        Extract semantic chunks from text with language-aware processing.
+        
+        Args:
+            text: Document text
+            language: Language code
+            
+        Returns:
+            List of Chunk objects
+        """
+        # Detect document type
+        doc_type = self.detect_document_type(text, language)
+        
+        chunks = []
+        
+        # Identify document sections
+        sections = self.identify_document_sections(text, language)
+        
+        # Process each section
+        for section_idx, (section_title, section_content) in enumerate(sections):
+            # Determine appropriate processing for this section
+            if doc_type == 'faq' or any(term in section_title.lower() for term in self.get_faq_terms(language)):
+                # Process as FAQ section
+                qa_pairs = self.extract_qa_pairs(section_content, language)
+                
+                if qa_pairs:
+                    for i, (question, answer) in enumerate(qa_pairs):
+                        chunks.append(Chunk(
+                            text=f"Q: {question}\nA: {answer}",
+                            section=section_title,
+                            type="qa_pair",
+                            metadata=ChunkMetadata(
+                                hasQuestion=True,
+                                documentType='faq',
+                                language=language,
+                                qaFormat="explicit",
+                                question=question,
+                                chunkIndex=len(chunks),
+                                totalChunks=0  # Will update later
+                            )
+                        ))
+                else:
+                    # No Q&A pairs found, process as regular text
+                    content_chunks = self.chunk_text(section_content, language)
+                    
+                    for i, chunk_text in enumerate(content_chunks):
+                        chunks.append(Chunk(
+                            text=chunk_text,
+                            section=section_title,
+                            type="content",
+                            metadata=ChunkMetadata(
+                                hasQuestion=False,
+                                documentType=doc_type,
+                                language=language,
+                                chunkIndex=len(chunks),
+                                totalChunks=0  # Will update later
+                            )
+                        ))
+            elif doc_type == 'policy' or any(term in section_title.lower() for term in self.get_policy_terms(language)):
+                # Process as policy section
+                
+                # Look for numbered clauses
+                script_group = self.get_script_group(language)
+                if script_group == 'cjk':
+                    # For CJK
+                    clause_pattern = r'(?:^|\n)\s*(?:\d+|[一二三四五六七八九十]+)[\.．、]\s*(.*?)(?=\n\s*(?:\d+|[一二三四五六七八九十]+)[\.．、]|\Z)'
+                elif script_group in ['devanagari', 'bengali', 'dravidian', 'gurmukhi', 'gujarati']:
+                    # For Indic scripts
+                    clause_pattern = r'(?:^|\n)\s*(?:\d+|[१२३४५६७८९०]+)[\.।]\s*(.*?)(?=\n\s*(?:\d+|[१२३४५६७८९०]+)[\.।]|\Z)'
+                elif script_group == 'arabic':
+                    # For Arabic script
+                    clause_pattern = r'(?:^|\n)\s*(?:\d+|[١٢٣٤٥٦٧٨٩٠]+)[\.،]\s*(.*?)(?=\n\s*(?:\d+|[١٢٣٤٥٦٧٨٩٠]+)[\.،]|\Z)'
+                else:
+                    # Default pattern 
+                    clause_pattern = r'(?:^|\n)\s*\d+\.\s*(.*?)(?=\n\s*\d+\.|\Z)'
+                
+                clauses = []
+                for match in re.finditer(clause_pattern, section_content, re.DOTALL):
+                    clauses.append(match.group(1).strip())
+                
+                if clauses:
+                    # Process clauses
+                    current_clauses = []
+                    current_size = 0
+                    max_size = 300  # max words per chunk
+                    
+                    for clause in clauses:
+                        clause_size = len(clause.split())
+                        
+                        if current_size + clause_size > max_size and current_clauses:
+                            # Save current chunk
+                            chunk_text = "\n\n".join(current_clauses)
+                            chunks.append(Chunk(
+                                text=chunk_text,
+                                section=section_title,
+                                type="policy_clauses",
+                                metadata=ChunkMetadata(
+                                    hasQuestion=False,
+                                    documentType='policy',
+                                    language=language,
+                                    chunkIndex=len(chunks),
+                                    totalChunks=0  # Will update later
+                                )
+                            ))
+                            current_clauses = [clause]
+                            current_size = clause_size
+                        else:
+                            current_clauses.append(clause)
+                            current_size += clause_size
+                    
+                    # Add remaining clauses
+                    if current_clauses:
+                        chunk_text = "\n\n".join(current_clauses)
+                        chunks.append(Chunk(
+                            text=chunk_text,
+                            section=section_title,
+                            type="policy_clauses",
+                            metadata=ChunkMetadata(
+                                hasQuestion=False,
+                                documentType='policy',
+                                language=language,
+                                chunkIndex=len(chunks),
+                                totalChunks=0  # Will update later
+                            )
+                        ))
+                else:
+                    # No clauses found, process as regular text
+                    content_chunks = self.chunk_text(section_content, language)
+                    
+                    for i, chunk_text in enumerate(content_chunks):
+                        chunks.append(Chunk(
+                            text=chunk_text,
+                            section=section_title,
+                            type="policy_content",
+                            metadata=ChunkMetadata(
+                                hasQuestion=False,
+                                documentType='policy',
+                                language=language,
+                                chunkIndex=len(chunks),
+                                totalChunks=0  # Will update later
+                            )
+                        ))
+            else:
+                # Process as general content
+                content_chunks = self.chunk_text(section_content, language)
+                
+                for i, chunk_text in enumerate(content_chunks):
+                    chunks.append(Chunk(
+                        text=chunk_text,
+                        section=section_title,
+                        type="content",
+                        metadata=ChunkMetadata(
+                            hasQuestion=False,
+                            documentType=doc_type,
+                            language=language,
+                            chunkIndex=len(chunks),
+                            totalChunks=0  # Will update later
+                        )
+                    ))
+        
+        # Update total chunks count
+        total_chunks = len(chunks)
+        for chunk in chunks:
+            chunk.metadata.totalChunks = total_chunks
+            
+        return chunks
+
+    def chunk_text(self, text: str, language: str, max_chunk_size: int = 300) -> List[str]:
+        """
+        Split text into appropriate sized chunks with language awareness.
+        
+        Args:
+            text: Text to chunk
+            language: Language code
+            max_chunk_size: Maximum words per chunk
+            
+        Returns:
+            List of text chunks
+        """
+        # Split text into paragraphs
+        paragraphs = re.split(r'\n\s*\n', text)
+        
+        # For CJK languages, which don't use spaces to separate words,
+        # we'll count characters instead of words
+        script_group = self.get_script_group(language)
+        count_chars = script_group == 'cjk' or script_group == 'thai'
+        
+        chunks = []
+        current_chunk = []
+        current_size = 0
+        
+        for paragraph in paragraphs:
+            paragraph = paragraph.strip()
+            if not paragraph:
+                continue
+            
+            # Skip very short paragraphs that are likely headers
+            words = paragraph.split() if not count_chars else [paragraph]
+            if not count_chars and len(words) < 3:
+                # If it looks like a header, add it to the current chunk
+                if current_chunk and re.match(r'^(?:\d+\.|\*|\-|\#)\s*[A-Z]', paragraph):
+                    current_chunk.append(paragraph)
+                continue
+            
+            # Determine paragraph size (words or characters)
+            paragraph_size = len(paragraph) if count_chars else len(words)
+            
+            # If this paragraph would exceed our chunk size limit, split it into sentences
+            if paragraph_size > max_chunk_size:
+                # Add current chunk if we have one
+                if current_chunk:
+                    chunks.append("\n\n".join(current_chunk))
+                    current_chunk = []
+                    current_size = 0
+                
+                # Split paragraph into sentences
+                sentences = self.split_into_sentences(paragraph, language)
+                
+                # Process sentences
+                current_sentences = []
+                current_sentences_size = 0
+                
+                for sentence in sentences:
+                    sentence = sentence.strip()
+                    if not sentence:
+                        continue
+                    
+                    # Determine sentence size
+                    sentence_size = len(sentence) if count_chars else len(sentence.split())
+                    
+                    # If this sentence would exceed our chunk size, add it as its own chunk
+                    if sentence_size > max_chunk_size:
+                        # Add current sentences if we have any
+                        if current_sentences:
+                            chunks.append(" ".join(current_sentences))
+                            current_sentences = []
+                            current_sentences_size = 0
+                        
+                        # Add long sentence as its own chunk
+                        chunks.append(sentence)
+                    
+                    # If adding this sentence would exceed our chunk size, finalize the current chunk
+                    elif current_sentences_size > 0 and current_sentences_size + sentence_size > max_chunk_size:
+                        chunks.append(" ".join(current_sentences))
+                        current_sentences = [sentence]
+                        current_sentences_size = sentence_size
+                    else:
+                        # Add to current sentences
+                        current_sentences.append(sentence)
+                        current_sentences_size += sentence_size
+                
+                # Add any remaining sentences
+                if current_sentences:
+                    chunks.append(" ".join(current_sentences))
+            
+            # If adding this paragraph would exceed our chunk size, start a new chunk
+            elif current_size > 0 and current_size + paragraph_size > max_chunk_size:
+                chunks.append("\n\n".join(current_chunk))
+                current_chunk = [paragraph]
+                current_size = paragraph_size
+            else:
+                # Add to current chunk
+                current_chunk.append(paragraph)
+                current_size += paragraph_size
+        
+        # Add any remaining content
+        if current_chunk:
+            chunks.append("\n\n".join(current_chunk))
+        
+        # Ensure we don't have empty chunks
+        return [chunk for chunk in chunks if chunk.strip()]
+
+    async def _setup_elasticsearch_indices(self):
         """Setup Elasticsearch indices with proper mappings for vector search"""
         # Original documents index
-        original_index = f"{base_index_name}_originals"
+        original_index = f"{self.es_config['tenant_document_index_name']}-originals"
         exists = await self.es_client.indices.exists(index=original_index)
         if not exists:
             await self.es_client.indices.create(
@@ -235,8 +1246,8 @@ class MultilingualMessageProcessor:
                 mappings={
                     "properties": {
                         "content": {"type": "text"},
-                        "tenant_id": {"type": "keyword"},
-                        "document_id": {"type": "keyword"},
+                        "tenantId": {"type": "keyword"},
+                        "documentId": {"type": "keyword"},
                         "metadata": {"type": "object", "enabled": True}
                     }
                 }
@@ -244,7 +1255,7 @@ class MultilingualMessageProcessor:
             logger.info(f"Created originals index: {original_index}")
         
         # Chunks index with vector field
-        chunks_index = base_index_name
+        chunks_index = self.es_config['tenant_document_index_name']
         exists = await self.es_client.indices.exists(index=chunks_index)
         if not exists:
             await self.es_client.indices.create(
@@ -252,501 +1263,275 @@ class MultilingualMessageProcessor:
                 mappings={
                     "properties": {
                         "content": {"type": "text"},
-                        "content_vector": {
+                        "contentVector": {
                             "type": "dense_vector",
                             "dims": 768,  # mpnet-base-v2 has 768 dimensions
                             "index": True,
                             "similarity": "cosine"
                         },
-                        "tenant_id": {"type": "keyword"},
-                        "document_id": {"type": "keyword"},
-                        "chunk_type": {"type": "keyword"},
-                        "section_title": {"type": "text"},
+                        "tenantId": {"type": "keyword"},
+                        "documentId": {"type": "keyword"},
+                        "chunkType": {"type": "keyword"},
+                        "sectionTitle": {"type": "text"},
                         "metadata": {"type": "object", "enabled": True}
                     }
                 }
             )
             logger.info(f"Created chunks index: {chunks_index}")
 
-    def _extract_semantic_chunks(self, text, language=None, max_chunk_size=300):
+    async def process_message(self, message: Dict[str, Any]):
         """
-        Extract semantic chunks from text, preserving context.
-        Works with multiple languages by using language-aware patterns and processing.
+        Process an individual message and store it in Elasticsearch with vector embeddings.
         
         Args:
-            text: Document text to process
-            language: Optional language code (e.g., 'en', 'es', 'fr')
-            max_chunk_size: Maximum words per chunk
-            
-        Returns:
-            List of chunk dictionaries
+            message: Message dictionary containing content and metadata.
         """
-        chunks = []
+        # Extract text content from message
+        content = message.get('content')
+        if not content:
+            logger.warning("Message has no content")
+            return
+
+        tenant_id = message.get('tenantId')
+        metadata = message.get('metadata', {}) or {}
+        document_id = message.get('documentId')
         
-        # If language not provided, detect it
+        # Check if language is specified in metadata, otherwise detect it
+        language = metadata.get('language')
         if not language:
-            language = detect_language(text)
+            language = self.detect_language(content)
+            metadata['language'] = language
         
-        # First, try to identify document sections
-        sections = self._identify_sections(text, language)
+        # Store original document first (for reference)
+        original_doc = {
+            'content': content,
+            'tenantId': tenant_id,
+            'metadata': metadata,
+            'documentId': document_id
+        }
         
-        # If no sections found, treat the whole document as one section
-        if not sections:
-            sections = [{"title": "General", "content": text}]
+        await self.es_client.index(
+            index=f"{self.es_config['tenant_document_index_name']}-originals",
+            document=original_doc,
+            id=document_id
+        )
+        logger.info(f"Indexed original document with ID: {document_id}")
         
-        for section in sections:
-            section_title = section["title"]
-            section_content = section["content"]
+        # Extract semantic chunks with language awareness
+        chunks = self.extract_chunks(content, language)
+        logger.info(f"Extracted {len(chunks)} semantic chunks from document")
+        
+        # Process and index each chunk
+        indexing_tasks = []
+        for i, chunk in enumerate(chunks):
+            # Generate vector embedding for the chunk
+            vector = self.st_model.encode(chunk.text).tolist()
             
-            # Extract explicit Q&A pairs (using language-aware patterns)
-            explicit_qa_pairs = self._identify_qa_pairs(section_content, language)
+            # Add any additional metadata from the message
+            combined_metadata = {**metadata}
+            combined_metadata.update(chunk.metadata.model_dump())
+            combined_metadata['chunkIndex'] = i
+            combined_metadata['totalChunks'] = len(chunks)
             
-            # Process explicit Q&A pairs
-            if explicit_qa_pairs:
-                for qa in explicit_qa_pairs:
-                    chunks.append({
-                        "text": qa["combined"],
-                        "section": section_title,
-                        "type": "qa_pair",
-                        "metadata": {
-                            "question": qa["question"],
-                            "has_question": True,
-                            "qa_format": "explicit"
-                        }
-                    })
-                
-                # Remove processed Q&A content from section
-                for qa in explicit_qa_pairs:
-                    section_content = section_content.replace(qa["combined"], "")
-                    section_content = section_content.replace(f"Q: {qa['question']}\nA: {qa['answer']}", "")
-                    # Handle other formats depending on language
-                    if language == 'es':
-                        section_content = section_content.replace(f"P: {qa['question']}\nR: {qa['answer']}", "")
-                    elif language == 'fr':
-                        section_content = section_content.replace(f"Q: {qa['question']}\nR: {qa['answer']}", "")
-                    elif language == 'de':
-                        section_content = section_content.replace(f"F: {qa['question']}\nA: {qa['answer']}", "")
-            
-            # Process remaining content to identify implicit Q&A and regular paragraphs
-            if section_content.strip():
-                # Split content into paragraphs
-                paragraphs = [p for p in re.split(r'\n\s*\n', section_content) if p.strip()]
-                
-                for paragraph in paragraphs:
-                    # Use NLTK for sentence tokenization (works for many languages)
-                    try:
-                        sentences = nltk.sent_tokenize(paragraph, language if language in ['en', 'es', 'fr', 'de', 'it', 'nl', 'pt'] else 'en')
-                    except Exception:
-                        # Fallback to simple tokenization if NLTK fails
-                        sentences = re.split(r'(?<=[.!?])\s+', paragraph)
-                    
-                    # Identify potential questions (sentences ending with '?', '？', etc.)
-                    question_indices = [i for i, s in enumerate(sentences) 
-                                      if re.search(r'[?？¿]+\s*$', s.strip())]
-                    
-                    # Process implicit Q&A pairs
-                    processed_indices = set()
-                    if question_indices:
-                        for idx in question_indices:
-                            question = sentences[idx].strip()
-                            
-                            # Skip if already processed
-                            if idx in processed_indices:
-                                continue
-                                
-                            # Determine the answer - either next sentence or remaining sentences
-                            if idx + 1 < len(sentences):
-                                # Simple answer (next sentence)
-                                if idx + 2 >= len(sentences) or idx + 2 in question_indices:
-                                    answer = sentences[idx + 1].strip()
-                                    answer_end_idx = idx + 1
-                                else:
-                                    # Take multiple sentences as the answer (up to next question or 3 sentences)
-                                    answer_end_idx = min(idx + 4, len(sentences))
-                                    next_question_idx = next((i for i in range(idx + 1, answer_end_idx) 
-                                                            if i in question_indices), answer_end_idx)
-                                    answer_end_idx = min(answer_end_idx, next_question_idx)
-                                    answer = ' '.join(sentences[idx + 1:answer_end_idx]).strip()
-                                
-                                # Create an implicit Q&A chunk
-                                if answer:  # Only if we have an answer
-                                    # Format Q&A based on language
-                                    qa_text = self._format_qa_pair(question, answer, language)
-                                    
-                                    chunks.append({
-                                        "text": qa_text,
-                                        "section": section_title,
-                                        "type": "qa_pair",
-                                        "metadata": {
-                                            "question": question,
-                                            "has_question": True,
-                                            "qa_format": "implicit"
-                                        }
-                                    })
-                                    
-                                    # Mark these sentences as processed
-                                    processed_indices.update(range(idx, answer_end_idx + 1))
-                    
-                    # Process remaining sentences as regular paragraphs
-                    remaining_sentences = [s for i, s in enumerate(sentences) if i not in processed_indices]
-                    remaining_text = ' '.join(remaining_sentences).strip()
-                    
-                    if remaining_text:
-                        # Check if the remaining text is too long
-                        if len(remaining_text.split()) > max_chunk_size:
-                            # Split into smaller chunks
-                            self._process_text_into_chunks(remaining_text, section_title, chunks, max_chunk_size, language)
-                        else:
-                            # Add as a single chunk
-                            chunks.append({
-                                "text": remaining_text,
-                                "section": section_title,
-                                "type": "paragraph",
-                                "metadata": {
-                                    "has_question": False
-                                }
-                            })
-        
-        return chunks
-
-    def _process_text_into_chunks(self, text, section_title, chunks, max_chunk_size, language):
-        """Helper method to split text into appropriate sized chunks"""
-        try:
-            sentences = nltk.sent_tokenize(text, language if language in ['en', 'es', 'fr', 'de', 'it', 'nl', 'pt'] else 'en')
-        except Exception:
-            sentences = re.split(r'(?<=[.!?])\s+', text)
-            
-        current_chunk = []
-        current_size = 0
-        
-        for sentence in sentences:
-            # Rough estimate of words
-            sentence_size = len(sentence.split())
-            
-            if current_size + sentence_size <= max_chunk_size:
-                current_chunk.append(sentence)
-                current_size += sentence_size
-            else:
-                # Save current chunk if not empty
-                if current_chunk:
-                    chunks.append({
-                        "text": ' '.join(current_chunk),
-                        "section": section_title,
-                        "type": "paragraph_chunk",
-                        "metadata": {
-                            "has_question": False
-                        }
-                    })
-                
-                # Start new chunk
-                current_chunk = [sentence]
-                current_size = sentence_size
-        
-        # Add final chunk if not empty
-        if current_chunk:
-            chunks.append({
-                "text": ' '.join(current_chunk),
-                "section": section_title,
-                "type": "paragraph_chunk",
-                "metadata": {
-                    "has_question": False
-                }
-            })
-
-    def _format_qa_pair(self, question, answer, language):
-        """Format Q&A pair based on language"""
-        if language == 'en':
-            return f"Q: {question}\nA: {answer}"
-        elif language == 'es':
-            return f"P: {question}\nR: {answer}"
-        elif language == 'fr':
-            return f"Q: {question}\nR: {answer}"
-        elif language == 'de':
-            return f"F: {question}\nA: {answer}"
-        elif language == 'it':
-            return f"D: {question}\nR: {answer}"
-        elif language == 'pt':
-            return f"P: {question}\nR: {answer}"
-        elif language == 'zh':
-            return f"问: {question}\n答: {answer}"
-        elif language == 'ja':
-            return f"質問: {question}\n回答: {answer}"
-        elif language == 'ko':
-            return f"질문: {question}\n답변: {answer}"
-        elif language == 'ru':
-            return f"В: {question}\nО: {answer}"
-        else:
-            # Default to English format
-            return f"Q: {question}\nA: {answer}"
-
-    def _identify_sections(self, text, language=None):
-        """
-        Identify sections in the document based on headers and structure.
-        Language-aware section detection.
-        
-        Returns a list of (section_title, section_content) dictionaries.
-        """
-        # Common header patterns (language-agnostic patterns work for most languages)
-        header_patterns = [
-            r"^#+\s+(.+)$",           # Markdown headers (universal)
-            r"^(.+)\n[=]+$",          # Underlined headers with = (universal)
-            r"^(.+)\n[-]+$",          # Underlined headers with - (universal)
-            r"^(\d+\.\s+.+)$",        # Numbered headers like "1. Introduction" (universal)
-            r"^([A-Z0-9][A-Za-z0-9\s]+)[:.]\s*$"  # Title Case followed by colon or period
-        ]
-        
-        # Split text into lines
-        lines = text.split('\n')
-        
-        sections = []
-        current_section = {"title": "Introduction", "content": []}
-        
-        for line in lines:
-            # Check if this line is a header
-            is_header = False
-            for pattern in header_patterns:
-                match = re.match(pattern, line)
-                if match:
-                    # Save current section if it has content
-                    if current_section["content"]:
-                        sections.append(current_section)
-                    
-                    # Start new section
-                    current_section = {
-                        "title": match.group(1).strip(),
-                        "content": []
-                    }
-                    is_header = True
-                    break
-            
-            # If not a header, add to current section
-            if not is_header:
-                current_section["content"].append(line)
-        
-        # Add the last section
-        if current_section["content"]:
-            sections.append(current_section)
-        
-        # Convert section content lists to strings
-        for section in sections:
-            section["content"] = '\n'.join(section["content"]).strip()
-        
-        return sections
-
-    def _identify_qa_pairs(self, text, language=None):
-        """
-        Identify potential question-answer pairs in text with explicit formatting.
-        Language-aware Q&A detection.
-        
-        Returns a list of (question, answer) dictionaries.
-        """
-        # Define Q&A patterns based on language
-        qa_patterns = []
-        
-        # English patterns (default)
-        en_patterns = [
-            r"(?:Q|Question)[:\.]?\s*(.*?)\s*(?:A|Answer)[:\.]?\s*([\s\S]*?)(?=(?:Q|Question)[:\.]|\Z)",
-            r"(?:\d+\.\s*)(.*?)\?[\s]+([\s\S]*?)(?=\d+\.\s*.*\?|\Z)",
-            r"(?:\*\s*)(.*?)\?[\s]+([\s\S]*?)(?=\*\s*.*\?|\Z)"
-        ]
-        
-        # Add language-specific patterns
-        if language == 'es':  # Spanish
-            qa_patterns.extend([
-                r"(?:P|Pregunta)[:\.]?\s*(.*?)\s*(?:R|Respuesta)[:\.]?\s*([\s\S]*?)(?=(?:P|Pregunta)[:\.]|\Z)",
-            ])
-        elif language == 'fr':  # French
-            qa_patterns.extend([
-                r"(?:Q|Question)[:\.]?\s*(.*?)\s*(?:R|Réponse)[:\.]?\s*([\s\S]*?)(?=(?:Q|Question)[:\.]|\Z)",
-            ])
-        elif language == 'de':  # German
-            qa_patterns.extend([
-                r"(?:F|Frage)[:\.]?\s*(.*?)\s*(?:A|Antwort)[:\.]?\s*([\s\S]*?)(?=(?:F|Frage)[:\.]|\Z)",
-            ])
-        elif language == 'zh':  # Chinese
-            qa_patterns.extend([
-                r"(?:问题|问)[：:]\s*(.*?)\s*(?:答案|答)[：:]\s*([\s\S]*?)(?=(?:问题|问)[：:]|\Z)",
-            ])
-        elif language == 'ja':  # Japanese
-            qa_patterns.extend([
-                r"(?:質問|Q)[：:]\s*(.*?)\s*(?:回答|A)[：:]\s*([\s\S]*?)(?=(?:質問|Q)[：:]|\Z)",
-            ])
-        
-        # Always include English patterns as fallback
-        qa_patterns.extend(en_patterns)
-        
-        qa_pairs = []
-        for pattern in qa_patterns:
-            matches = re.findall(pattern, text, re.MULTILINE)
-            for match in matches:
-                if len(match) == 2 and match[0].strip() and match[1].strip():
-                    # Format the Q&A text based on language
-                    qa_text = self._format_qa_pair(match[0].strip(), match[1].strip(), language)
-                    
-                    qa_pairs.append({
-                        "question": match[0].strip(),
-                        "answer": match[1].strip(),
-                        "combined": qa_text
-                    })
-        
-        return qa_pairs
-
-    async def process_message(self, message):
-        """Process individual message and store in Elasticsearch with vectors"""
-        try:
-            # Extract text content from message
-            content = message.get('content')
-            if not content:
-                logger.warning("Message has no content")
-                return
-
-            tenant_id = message.get('tenant_id')
-            metadata = message.get('metadata', {})
-            document_id = str(uuid.uuid4())
-            
-            # Check if language is specified in metadata, otherwise detect it
-            language = metadata.get('language')
-            if not language:
-                language = detect_language(content)
-                metadata['language'] = language
-            
-            # Store original document first (for reference and email templates)
-            original_doc = {
-                'content': content,
-                'tenant_id': tenant_id,
-                'metadata': metadata,
-                'document_id': document_id
+            # Prepare chunk document
+            chunk_doc = {
+                'content': chunk.text,
+                'contentVector': vector,
+                'tenantId': tenant_id,
+                'documentId': document_id,
+                'chunkType': chunk.type,
+                'sectionTitle': chunk.section,
+                'metadata': combined_metadata
             }
             
-            await self.es_client.index(
-                index=f"{ES_CONFIG['index_name']}_originals",
-                document=original_doc,
-                id=document_id
-            )
-            logger.info(f"Indexed original document with ID: {document_id}")
-            
-            # Extract semantic chunks with language awareness
-            chunks = self._extract_semantic_chunks(content, language)
-            logger.info(f"Extracted {len(chunks)} semantic chunks from document")
-            
-            # Process and index each chunk
-            indexing_tasks = []
-            for i, chunk in enumerate(chunks):
-                # Generate vector embedding for the chunk
-                vector = self.st_model.encode(chunk["text"]).tolist()
-                
-                # Prepare chunk document
-                chunk_doc = {
-                    'content': chunk["text"],
-                    'content_vector': vector,
-                    'tenant_id': tenant_id,
-                    'document_id': document_id,
-                    'chunk_type': chunk["type"],
-                    'section_title': chunk["section"],
-                    'metadata': {
-                        **metadata,
-                        **chunk.get("metadata", {}),
-                        'chunk_index': i,
-                        'total_chunks': len(chunks)
-                    }
-                }
-                
-                # Index the chunk
-                chunk_id = f"{document_id}_chunk_{i}"
-                indexing_tasks.append(
-                    self.es_client.index(
-                        index=ES_CONFIG['index_name'],
-                        document=chunk_doc,
-                        id=chunk_id
-                    )
+            # Index the chunk
+            chunk_id = f"{document_id}_chunk_{i}"
+            indexing_tasks.append(
+                self.es_client.index(
+                    index=self.es_config['tenant_document_index_name'],
+                    document=chunk_doc,
+                    id=chunk_id
                 )
-            
-            # Wait for all indexing tasks to complete
-            await asyncio.gather(*indexing_tasks)
-            
-            logger.info(f"Successfully indexed all {len(chunks)} chunks for document {document_id}")
-            
-        except Exception as e:
-            logger.error(f"Error processing message: {str(e)}", exc_info=True)
-
-    def safe_json_deserializer(self, x):
-        """Safely deserialize JSON, return None if invalid"""
-        try:
-            return json.loads(x.decode("utf-8"))
-        except json.JSONDecodeError as e:
-            logger.error(f"Invalid JSON received: {x}. Error: {e}")
-            return {"raw_message": x.decode("utf-8"), "error": str(e)}
-
-    async def send_to_dead_letter_queue(self, message, error):
-        """Send problematic messages to a dead letter topic"""
-        error_message = {
-            "original_message": message,
-            "error": error
+            )
+        
+        # Wait for all indexing tasks to complete
+        await asyncio.gather(*indexing_tasks)
+        
+        # Delete old inactive documents for this tenant
+        delete_query = {
+            "query": {
+                "bool": {
+                    "must": [
+                        {"term": {"tenantId": tenant_id}},
+                        {"term": {"metadata.inactive": True}}
+                    ]
+                }
+            }
         }
+        
+        # Delete from both indices
+        await self.es_client.delete_by_query(
+            index=self.es_config['tenant_document_index_name'], 
+            body=delete_query
+        )
+        await self.es_client.delete_by_query(
+            index=f"{self.es_config['tenant_document_index_name']}-originals", 
+            body=delete_query
+        )
+        
+        logger.info(f"Deleted old inactive documents for tenant_id: {tenant_id}")
+        
+        # Send success response
+        await self.publish_kafka_message(
+            self.response_topic,
+            tenant_id,
+            DataStorageDto(
+                tenantId=tenant_id,
+                documentId=document_id,
+                status='success'
+            )
+        )
+        
+        logger.info(f"Successfully indexed all {len(chunks)} chunks for document {document_id}")
+
+    async def publish_kafka_message(self, topic: str, key: str, message: Any):
+        """
+        Publish a message to a Kafka topic.
+        
+        Args:
+            topic: Kafka topic.
+            key: Message key.
+            message: Message payload (will be JSON serialized).
+            
+        Returns:
+            Future for the message delivery.
+        """
+        serialized_key = str(key).encode("utf-8")
+        
+        if isinstance(message, BaseModel):
+            serialized_value = json.dumps(message.model_dump()).encode("utf-8")
+        else:
+            serialized_value = json.dumps(message).encode("utf-8")
+        
+        # Create an asyncio Future to wait for delivery report
+        future = asyncio.Future()
         
         def delivery_callback(err, msg):
             if err:
-                logger.error(f"Failed to send to dead letter queue: {err}")
+                future.set_exception(Exception(f"Message delivery failed: {err} for key: {key}"))
             else:
-                logger.info(f"Message sent to dead_letter_topic")
+                future.set_result(msg)
         
-        self.producer.produce("dead_letter_topic", json.dumps(error_message).encode('utf-8'), callback=delivery_callback)
-        self.producer.poll(0)  # Trigger delivery callbacks
+        self.producer.produce(
+            topic,
+            key=serialized_key,
+            value=serialized_value,
+            callback=delivery_callback
+        )
+        self.producer.poll(1)  # Trigger delivery callbacks
+        self.producer.flush()
+        
+        return await future
+
+    async def send_to_dead_letter_queue(self, message: Dict[str, Any], error: str):
+        """
+        Send problematic messages to a dead letter topic.
+        
+        Args:
+            message: Original message.
+            error: Error description.
+        """
+        error_message = {
+            "original_message": message,
+            "error": error,
+            "timestamp": str(datetime.datetime.now())
+        }
+        
+        await self.publish_kafka_message(
+            self.dlq_topic,
+            message.get('tenantId', 'unknown'),
+            error_message
+        )
+        logger.info(f"Message sent to dead_letter_topic due to: {error}")
+
+    def _parse_message(self, message_value: Any) -> Dict[str, Any]:
+        """
+        Parse message value into a dictionary.
+        
+        Args:
+            message_value: Raw message value.
+            
+        Returns:
+            Parsed message as a dictionary.
+        """
+        if isinstance(message_value, bytes):
+            try:
+                return json.loads(message_value.decode('utf-8'))
+            except json.JSONDecodeError as e:
+                logger.warning(f"Failed to parse message as JSON: {e}")
+                return {"raw_content": message_value.decode('utf-8', errors='replace')}
+        elif isinstance(message_value, str):
+            try:
+                return json.loads(message_value)
+            except json.JSONDecodeError:
+                return {"raw_content": message_value}
+        elif isinstance(message_value, dict):
+            return message_value
+        else:
+            return {"raw_content": str(message_value)}
 
     async def consume_messages(self):
-        """Consume messages from Kafka"""
+        """Consume messages from Kafka queue and process them."""
         consumer = Consumer(self.consumer_config)
         
         try:
             # Subscribe to topic
-            consumer.subscribe([self.topic])
+            consumer.subscribe([self.request_topic])
+            logger.info(f"Subscribed to topic: {self.request_topic}")
             
             while True:
                 msg = consumer.poll(1.0)
-                
                 if msg is None:
                     continue
                 
                 if msg.error():
                     if msg.error().code() == KafkaException._PARTITION_EOF:
-                        # End of partition event
                         logger.info(f"Reached end of partition {msg.partition()}")
                     else:
-                        # Error
                         logger.error(f"Error: {msg.error()}")
                     continue
                 
                 # Process message
                 try:
-                    value = msg.value()
-                    if isinstance(value, bytes):
-                        value = json.loads(value.decode('utf-8'))
-                    elif isinstance(value, str):
-                        value = json.loads(value)
+                    value = self._parse_message(msg.value())
                     
                     logger.info(f"Received message from partition {msg.partition()}, offset {msg.offset()}")
                     await self.process_message(value)
-                    logger.info(f"Successfully processed message for tenant {value.get('tenant_id')}")
+                    
                 except Exception as e:
                     logger.error(f"Error processing message: {str(e)}", exc_info=True)
-                    await self.send_to_dead_letter_queue(value, str(e))
+                    await self.send_to_dead_letter_queue(
+                        self._parse_message(msg.value()) if msg.value() else {},
+                        str(e)
+                    )
                     
         except KeyboardInterrupt:
             pass
         finally:
             # Close the consumer
             consumer.close()
+            logger.info("Kafka consumer closed")
 
     async def run(self):
-        """Main processing loop"""
-        logger.info("Starting message processing...")
+        """Main processing loop."""
+        logger.info("Starting multilingual message processor...")
         
         # Initialize producer
         self.producer = Producer(self.producer_config)
-        logger.info("Producer initialized successfully")
+        logger.info("Kafka producer initialized successfully")
         
         # Setup Elasticsearch indices
-        await self._setup_elasticsearch_indices(ES_CONFIG['index_name'])
+        await self._setup_elasticsearch_indices()
         
         # Start consuming messages
         try:
@@ -757,25 +1542,25 @@ class MultilingualMessageProcessor:
             await self.shutdown()
 
     async def shutdown(self):
-        """Graceful shutdown"""
+        """Graceful shutdown of resources."""
         logger.info("Shutting down...")
-        
-        # Close the HTTP client
-        await self.http_client.aclose()
         
         # Close the Elasticsearch client
         await self.es_client.close()
         
         # Ensure all messages are delivered before shutting down producer
-        self.producer.flush()
+        if self.producer:
+            self.producer.flush()
         
         logger.info("Resources closed.")
+
+
+
 
 # Example usage
 if __name__ == "__main__":
     # Initialize processor
-    processor = MultilingualMessageProcessor()
-    logger.info("Initializing multilingual message processor...")
+    processor = MultilingualMessageProcessor(ES_CONFIG, KAFKA_CONFIG)
     
-    # Run the processor in an asyncio event loop
+    # Run the processor
     asyncio.run(processor.run())

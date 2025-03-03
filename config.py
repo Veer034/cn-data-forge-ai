@@ -6,17 +6,12 @@ load_dotenv()
 KAFKA_CONFIG = {
     'bootstrap_servers': os.getenv('KAFKA_BOOTSTRAP_SERVERS', "localhost:9092,broker:29092"),
     'group_id':'vector_processor',
-    'topic': os.getenv('KAFKA_TOPIC', 'messages')
+    'vector_storage_request_topic': os.getenv('TENANT_DOCUMENTS_VECTOR_STORAGE_REQUEST_TOPIC', 'tenant.documents.vector.storage.request'),
+    'vector_storage_request_dlq_topic': os.getenv('TENANT_DOCUMENTS_VECTOR_STORAGE_REQUEST_DLQ_TOPIC', 'tenant.documents.vector.storage.request_DLQ'),
+    'vector_storage_response_topic': os.getenv('TENANT_DOCUMENTS_VECTOR_STORAGE_RESPONSE_TOPIC', 'tenant.documents.vector.storage.response')
 }
-
-# KAFKA_CONFIG = {
-#     'bootstrap_servers':"localhost:9092",
-#     'group_id':'vector_processor',
-#     'topic': os.getenv('KAFKA_TOPIC', 'messages')
-# }
-
 
 ES_CONFIG = {
     'hosts': os.getenv('ES_HOSTS', 'http://localhost:9200'),
-    'index_name': os.getenv('ES_INDEX_NAME', 'messages')
+    'tenant_document_index_name': os.getenv('ES_TENANT_DOCUMENTS_INDEX_NAME', 'tenant-documents')
 }
