@@ -156,7 +156,7 @@ class MultilingualMessageProcessor:
         """Initialize section header terms for different languages"""
         headers = {
             # Default/English
-            'default': ['section', 'chapter', 'part'],
+            'en': ['section', 'chapter', 'part'],
             
             # Latin script European languages
             'de': ['abschnitt', 'kapitel', 'teil'],
@@ -239,7 +239,7 @@ class MultilingualMessageProcessor:
         """Initialize FAQ-related terms for different languages"""
         terms = {
             # Default/English
-            'default': ['faq', 'frequently asked questions', 'questions and answers', 'q&a'],
+            'en': ['faq', 'frequently asked questions', 'questions and answers', 'q&a'],
             
             # Latin script European languages
             'de': ['faq', 'häufig gestellte fragen', 'fragen und antworten'],
@@ -319,7 +319,7 @@ class MultilingualMessageProcessor:
         """Initialize policy-related terms for different languages"""
         terms = {
             # Default/English
-            'default': ['policy', 'terms', 'conditions', 'agreement', 'privacy', 'legal'],
+            'en': ['policy', 'terms', 'conditions', 'agreement', 'privacy', 'legal'],
             
             # Latin script European languages
             'de': ['richtlinie', 'bedingungen', 'vereinbarung', 'datenschutz', 'rechtlich'],
@@ -399,7 +399,7 @@ class MultilingualMessageProcessor:
         """Initialize Q&A markers for different languages"""
         markers = {
             # Default/English
-            'default': [('Q', 'A'), ('Question', 'Answer')],
+            'en': [('Q', 'A'), ('Question', 'Answer')],
             
             # Latin script European languages
             'de': [('F', 'A'), ('Frage', 'Antwort')],
@@ -489,7 +489,7 @@ class MultilingualMessageProcessor:
         for group, langs in self.SCRIPT_GROUPS.items():
             if language in langs:
                 return group
-        return 'latin'  # Default to Latin script
+        return 'en'  # Default to Latin script
 
     def get_sentence_end_markers(self, language: str) -> List[str]:
         """
@@ -514,7 +514,7 @@ class MultilingualMessageProcessor:
         Returns:
             List of section header terms
         """
-        return self.SECTION_HEADERS.get(language, self.SECTION_HEADERS['default'])
+        return self.SECTION_HEADERS.get(language, self.SECTION_HEADERS['en'])
 
     def get_faq_terms(self, language: str) -> List[str]:
         """
@@ -526,7 +526,7 @@ class MultilingualMessageProcessor:
         Returns:
             List of FAQ terms
         """
-        return self.FAQ_TERMS.get(language, self.FAQ_TERMS['default'])
+        return self.FAQ_TERMS.get(language, self.FAQ_TERMS['en'])
 
     def get_policy_terms(self, language: str) -> List[str]:
         """
@@ -538,7 +538,7 @@ class MultilingualMessageProcessor:
         Returns:
             List of policy terms
         """
-        return self.POLICY_TERMS.get(language, self.POLICY_TERMS['default'])
+        return self.POLICY_TERMS.get(language, self.POLICY_TERMS['en'])
 
     def get_qa_markers(self, language: str) -> List[Tuple[str, str]]:
         """
@@ -550,7 +550,7 @@ class MultilingualMessageProcessor:
         Returns:
             List of (question_marker, answer_marker) tuples
         """
-        return self.QA_MARKERS.get(language, self.QA_MARKERS['default'])
+        return self.QA_MARKERS.get(language, self.QA_MARKERS['en'])
 
     def detect_language(self, text: str) -> str:
         """
@@ -665,6 +665,7 @@ class MultilingualMessageProcessor:
         
         # Check for FAQ indicators in the appropriate language
         faq_terms = self.get_faq_terms(language)
+        logger.info(f" faq_terms : {faq_terms} , text_lower : {text_lower}")
         if any(term in text_lower for term in faq_terms):
             return 'faq'
         
@@ -975,7 +976,7 @@ class MultilingualMessageProcessor:
         """
         # Detect document type
         doc_type = self.detect_document_type(text, language)
-        
+        logger.info(f"doc_type: {doc_type}")
         chunks = []
         
         # Identify document sections
