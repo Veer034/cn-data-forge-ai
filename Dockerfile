@@ -21,7 +21,12 @@ RUN pip install "numpy<2.0.0" \
     transformers==4.49.0 \
     python-dotenv==1.0.1 \
     nltk==3.8.1 \
-    langdetect==1.0.9
+    langdetect==1.0.9 \
+    fasttext==0.9.2 \
+    lingua-language-detector==1.3.2 \
+    pycld2==0.41 \
+    polyglot==16.7.4 \
+    morfessor==2.0.6
 
 # Copy your application
 # COPY . .

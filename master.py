@@ -9,6 +9,9 @@ from elasticsearch import AsyncElasticsearch
 from confluent_kafka import Consumer, Producer, KafkaException
 from pydantic import BaseModel
 from config import KAFKA_CONFIG,ES_CONFIG
+from libaryLanguage import LibraryLanguageDetector
+
+
 
 # Configure logging
 logging.basicConfig(
@@ -94,6 +97,8 @@ class MultilingualMessageProcessor:
         
         # Initialize Kafka producer
         self.producer = None
+
+        self.libraryDetector = LibraryLanguageDetector()
 
         # Define language script groupings
         self.SCRIPT_GROUPS = {
@@ -552,103 +557,23 @@ class MultilingualMessageProcessor:
         """
         return self.QA_MARKERS.get(language, self.QA_MARKERS['en'])
 
-    def detect_language(self, text: str) -> str:
-        """
-        Language detection with support for 70+ languages.
-        
-        Args:
-            text: Text to detect language for
+    def detect_best_language(self,text):
+   
+        if len(self.libraryDetector.available_libraries) > 0:
+            lib_signals = self.libraryDetector._detect_with_libraries(text)
+            logger.info(f" libraryDetector {lib_signals} ")
             
-        Returns:
-            ISO language code
-        """
-        try:
-            from langdetect import detect, DetectorFactory
-            # Set seed for deterministic results
-            DetectorFactory.seed = 0
-            return detect(text)
-        except (ImportError, Exception) as e:
-            logger.warning(f"Error using langdetect: {str(e)}. Falling back to script-based detection.")
-            
-            # Script-based detection for non-Latin scripts
-            # Devanagari (Hindi, Marathi, Nepali)
-            if re.search(r'[\u0900-\u097F]', text):
-                return 'hi'  # Default to Hindi
-                
-            # Bengali
-            if re.search(r'[\u0980-\u09FF]', text):
-                return 'bn'
-                
-            # Gurmukhi (Punjabi)
-            if re.search(r'[\u0A00-\u0A7F]', text):
-                return 'pa'
-                
-            # Gujarati
-            if re.search(r'[\u0A80-\u0AFF]', text):
-                return 'gu'
-                
-            # Tamil
-            if re.search(r'[\u0B80-\u0BFF]', text):
-                return 'ta'
-                
-            # Telugu
-            if re.search(r'[\u0C00-\u0C7F]', text):
-                return 'te'
-                
-            # Kannada
-            if re.search(r'[\u0C80-\u0CFF]', text):
-                return 'kn'
-                
-            # Malayalam
-            if re.search(r'[\u0D00-\u0D7F]', text):
-                return 'ml'
-                
-            # Sinhala
-            if re.search(r'[\u0D80-\u0DFF]', text):
-                return 'si'
-                
-            # Thai
-            if re.search(r'[\u0E00-\u0E7F]', text):
-                return 'th'
-                
-            # Cyrillic
-            if re.search(r'[\u0400-\u04FF]', text):
-                # Try to distinguish between Cyrillic languages
-                if re.search(r'[ії]', text):
-                    return 'uk'  # Ukrainian
-                elif re.search(r'[ђљњ]', text):
-                    return 'sr-cyr'  # Serbian Cyrillic
-                else:
-                    return 'ru'  # Default to Russian
-                
-            # Greek
-            if re.search(r'[\u0370-\u03FF]', text):
-                return 'el'
-                
-            # Hebrew
-            if re.search(r'[\u0590-\u05FF]', text):
-                return 'he'
-                
-            # Arabic
-            if re.search(r'[\u0600-\u06FF]', text):
-                # Try to distinguish between Arabic script languages
-                if re.search(r'[پچژگ]', text):
-                    return 'fa'  # Persian
-                elif re.search(r'[ٹڈڑں]', text):
-                    return 'ur'  # Urdu
-                else:
-                    return 'ar'  # Default to Arabic
-                
-            # CJK (Chinese, Japanese, Korean)
-            if re.search(r'[\u3040-\u30FF]', text):
-                return 'ja'  # Japanese-specific characters
-            elif re.search(r'[\uAC00-\uD7AF]', text):
-                return 'ko'  # Korean-specific characters
-            elif re.search(r'[\u4E00-\u9FFF]', text):
-                return 'zh'  # Default to Chinese for general CJK
-                
-            # Default to English for primarily Latin script
-            return 'en'
+            if lib_signals:
+                # Get best library result
+                best_signal = max(lib_signals, key=lambda x: x[2])
+                _, lang, conf = best_signal
+                if conf > 0.5:  # If reasonably confident
+                    return lang
+                    
+        # 3. Fall back to combined approach
+        return 'en'
+
+
 
     def detect_document_type(self, text: str, language: str) -> str:
         """
@@ -1300,7 +1225,7 @@ class MultilingualMessageProcessor:
         # Check if language is specified in metadata, otherwise detect it
         language = metadata.get('language')
         if not language:
-            language = self.detect_language(content)
+            language = self.detect_best_language(content)
             metadata['language'] = language
         
         # Store original document first (for reference)

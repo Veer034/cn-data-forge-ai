@@ -111,6 +111,7 @@ Activiate Env
     python3.10 -m venv myvenv
     source myvenv/bin/activate
 
+    #make sure version is 3.10.*
     python --version
 
 Install library in local VM
@@ -119,6 +120,9 @@ Install library in local VM
     brew install librdkafka
 
     pip install "numpy<2.0.0" aiohttp sentence-transformers elasticsearch confluent-kafka httpx nltk python-dotenv transformers langdetect pydantic
+
+    #For language detection
+    pip install langdetect fasttext lingua-language-detector pycld2 polyglot pyicu morfessor
 
 Start in local
 
@@ -164,6 +168,10 @@ cat temp_message.json | jq -c . | docker exec -i broker kafka-console-producer \
  --topic tenant.documents.vector.storage.request \
  --property "parse.key=false" \
  --property "key.separator=,"
+
+# Remove the temporary file
+
+rm temp_message.json
 
     English tenant B
 
