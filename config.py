@@ -8,7 +8,7 @@ KAFKA_CONFIG = {
     'group_id':'vector_processor',
     'vector_storage_request_topic': os.getenv('TENANT_DOCUMENTS_VECTOR_STORAGE_REQUEST_TOPIC', 'tenant.documents.vector.storage.request'),
     'vector_storage_request_dlq_topic': os.getenv('TENANT_DOCUMENTS_VECTOR_STORAGE_REQUEST_DLQ_TOPIC', 'tenant.documents.vector.storage.request_DLQ'),
-    'vector_storage_response_topic': os.getenv('TENANT_DOCUMENTS_VECTOR_STORAGE_RESPONSE_TOPIC', 'tenant.documents.vector.storage.response')
+    'vector_storage_response_topic': os.getenv('DATA_FORGE_AI_VECTOR_STORAGE_RESPONSE_TOPIC', 'data.forge.ai.vector.storage.response')
 }
 
 ES_CONFIG = {
