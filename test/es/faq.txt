@@ -1,0 +1,29 @@
+#QA_SECTION: Preguntas sobre Cuenta de Cliente
+
+Q: ¿Cómo creo una nueva cuenta?
+A: Para crear una nueva cuenta, visite nuestro sitio web y haga clic en el botón "Registrarse" en la esquina superior derecha. Necesitará proporcionar su dirección de correo electrónico y crear una contraseña. Le enviaremos un correo electrónico de verificación para completar el proceso.
+
+Q: ¿Cómo puedo restablecer mi contraseña?
+A: Puede restablecer su contraseña haciendo clic en el enlace "Olvidé mi contraseña" en la página de inicio de sesión. Ingrese su dirección de correo electrónico y le enviaremos instrucciones para crear una nueva contraseña.
+
+Q: ¿Puedo tener múltiples usuarios en una cuenta?
+A: Sí, nuestros planes Business y Enterprise admiten múltiples usuarios. El administrador de la cuenta puede agregar nuevos usuarios yendo a "Configuración de la cuenta" > "Gestión de usuarios" y haciendo clic en "Agregar usuario".
+
+#QA_SECTION: Facturación y Pagos
+
+Q: ¿Qué métodos de pago aceptan?
+A: Aceptamos todas las principales tarjetas de crédito (Visa, Mastercard, American Express), PayPal y transferencias bancarias para suscripciones anuales.
+
+Q: ¿Con qué frecuencia se me facturará?
+A: La facturación se realiza mensual o anualmente, dependiendo del plan de suscripción que elija. Los planes anuales incluyen un descuento del 15%.
+
+Q: ¿Existe una renovación automática?
+A: Sí, las suscripciones se renuevan automáticamente al final de su período de facturación a menos que cancele a través de la configuración de su cuenta.
+
+#QA_SECTION: Características del Producto
+
+Q: ¿Su plataforma funciona en dispositivos móviles?
+A: Sí, nuestra plataforma es completamente responsive y funciona en todos los smartphones y tablets modernos. También ofrecemos aplicaciones móviles dedicadas para iOS y Android.
+
+Q: ¿Qué formatos de archivo puedo importar?
+A: Nuestro sistema admite importaciones desde formatos CSV, XLS, XLSX, JSON y XML. El tamaño máximo de archivo es de 50MB.

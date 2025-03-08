@@ -1,0 +1,127 @@
+# BASE DE CONOCIMIENTOS DE NOMBRE DE LA EMPRESA
+
+# SECCIÓN 1: DESCRIPCIÓN GENERAL DE LA EMPRESA
+Nuestra empresa fue fundada en 2015 con la misión de proporcionar soluciones innovadoras...
+
+Actualmente operamos en 12 países con sede central en Singapur y oficinas regionales en...
+
+## Nuestra Historia
+1. 2015: Empresa fundada por Jane Smith y John Doe
+2. 2017: Lanzamiento de nuestro producto estrella XYZ
+3. 2020: Expansión a mercados europeos
+4. 2023: Alcanzamos 1 millón de clientes en todo el mundo
+
+## Equipo Directivo
+- CEO: Jane Smith, quien previamente...
+- CTO: John Doe, un experto en...
+- CFO: David Johnson, con 15 años de experiencia en...
+
+# SECCIÓN 2: PRODUCTOS Y SERVICIOS
+
+## Producto X
+El Producto X es nuestra oferta principal diseñada para ayudar a las empresas a...
+
+### Especificaciones Técnicas
+- Capacidad de procesamiento: 10,000 solicitudes por segundo
+- Compatibilidad: Funciona con todas las principales plataformas
+- Seguridad: Cifrado de extremo a extremo y cumplimiento con ISO 27001
+
+## Servicio Y
+Nuestro Servicio Y proporciona soporte continuo a través de...
+
+# SECCIÓN 3: PREGUNTAS FRECUENTES
+
+## Gestión de Cuenta
+
+Q: ¿Cómo creo una nueva cuenta?
+A: Para crear una nueva cuenta, visite nuestro sitio web y haga clic en el botón "Registrarse" en la esquina superior derecha. Necesitará proporcionar su dirección de correo electrónico y crear una contraseña. Le enviaremos un correo electrónico de verificación para completar el proceso.
+
+Q: ¿Cómo puedo restablecer mi contraseña?
+A: Puede restablecer su contraseña haciendo clic en el enlace "Olvidé mi contraseña" en la página de inicio de sesión. Ingrese su dirección de correo electrónico y le enviaremos instrucciones para crear una nueva contraseña.
+
+Q: ¿Puedo tener múltiples usuarios en una cuenta?
+A: Sí, nuestros planes Business y Enterprise admiten múltiples usuarios. El administrador de la cuenta puede agregar nuevos usuarios yendo a "Configuración de la cuenta" > "Gestión de usuarios" y haciendo clic en "Agregar usuario".
+
+## Facturación y Pagos
+
+Q: ¿Qué métodos de pago aceptan?
+A: Aceptamos todas las principales tarjetas de crédito (Visa, Mastercard, American Express), PayPal y transferencias bancarias para suscripciones anuales.
+
+Q: ¿Con qué frecuencia se me facturará?
+A: La facturación se realiza mensual o anualmente, dependiendo del plan de suscripción que elija. Los planes anuales incluyen un descuento del 15%.
+
+Q: ¿Puedo cambiar mi plan de suscripción?
+A: Sí, puede actualizar o degradar su suscripción en cualquier momento a través de la sección "Facturación" en la configuración de su cuenta. Los cambios entran en vigor al comienzo de su próximo ciclo de facturación.
+
+# SECCIÓN 4: GUÍA DE SOLUCIÓN DE PROBLEMAS
+
+## Problemas Comunes y Soluciones
+
+### Aplicación que No Responde
+Si la aplicación deja de responder, intente estos pasos:
+1. Actualice la página
+2. Borre la caché del navegador
+3. Asegúrese de estar utilizando un navegador compatible
+4. Verifique su conexión a Internet
+
+### Fallos en la Importación de Datos
+Cuando experimente problemas con las importaciones de datos:
+1. Verifique que el formato de su archivo coincida con nuestros requisitos
+2. Compruebe que su archivo no exceda el límite de 50MB
+3. Asegúrese de que todos los campos requeridos estén presentes
+
+# SECCIÓN 5: TÉRMINOS Y POLÍTICAS
+
+## Términos de Servicio
+
+1. Aceptación de Términos
+   1.1. Al acceder o utilizar nuestros servicios, acepta estar sujeto a estos Términos de Servicio.
+   1.2. Si no está de acuerdo con estos términos, no debe utilizar nuestros servicios.
+
+2. Cuentas de Usuario
+   2.1. Usted es responsable de mantener la seguridad de su cuenta.
+   2.2. Debe notificarnos inmediatamente de cualquier acceso no autorizado.
+
+3. Propiedad Intelectual
+   3.1. Nuestro contenido está protegido por derechos de autor, marcas comerciales y otras leyes.
+   3.2. No puede reproducir ni distribuir nuestros materiales sin permiso.
+
+## Política de Privacidad
+
+1. Recopilación de Información
+   1.1. Recopilamos información personal cuando crea una cuenta.
+   1.2. Recopilamos automáticamente datos de uso cuando utiliza nuestros servicios.
+
+2. Uso de la Información
+   2.1. Utilizamos su información para proporcionar y mejorar nuestros servicios.
+   2.2. Podemos utilizar su dirección de correo electrónico para enviar notificaciones relacionadas con el servicio.
+
+3. Seguridad de Datos
+   3.1. Implementamos medidas de seguridad para proteger su información personal.
+   3.2. A pesar de nuestros esfuerzos, ningún método de transmisión por Internet es 100% seguro.
+
+## Política de Reembolso
+
+1. Elegibilidad para Reembolsos
+   1.1. Puede solicitar un reembolso dentro de los 14 días posteriores a su compra inicial.
+   1.2. Los reembolsos no están disponibles para períodos parciales de suscripción.
+
+2. Proceso de Reembolso
+   2.1. Envíe solicitudes de reembolso a través de nuestro portal de soporte.
+   2.2. Los reembolsos aprobados se procesarán dentro de 5-7 días hábiles.
+
+# SECCIÓN 6: INFORMACIÓN DE CONTACTO
+
+## Atención al Cliente
+- Correo electrónico: soporte@nombredelaempresa.com
+- Teléfono: +1-800-123-4567
+- Horario: Lunes a Viernes, 9 AM - 6 PM EST
+
+## Consultas de Ventas
+- Correo electrónico: ventas@nombredelaempresa.com
+- Teléfono: +1-800-765-4321
+
+## Ubicaciones de Oficinas
+- Sede Central: 123 Main Street, Singapur 123456
+- Europa: 45 Business Avenue, Londres EC1A 1BB, Reino Unido
+- América del Norte: 789 Corporate Drive, Nueva York, NY 10001, EE.UU.

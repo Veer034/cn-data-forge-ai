@@ -3,6 +3,7 @@ import json
 import logging
 import asyncio
 import datetime
+import uuid
 from typing import List, Dict, Any, Optional, Tuple, Set
 from sentence_transformers import SentenceTransformer
 from elasticsearch import AsyncElasticsearch
@@ -91,9 +92,12 @@ class MultilingualMessageProcessor:
         }
         
         # Kafka topics
-        self.request_topic = kafka_config['vector_storage_request_topic']
+        self.document_request_topic = kafka_config['document_storage_request_topic']
+        self.document_dlq_topic = kafka_config['document_storage_request_dlq_topic']
+        
+        self.faq_request_topic = kafka_config['faq_storage_request_topic']
+        self.faq_dlq_topic = kafka_config['faq_storage_request_dlq_topic']
         self.response_topic = kafka_config['vector_storage_response_topic']
-        self.dlq_topic = kafka_config['vector_storage_request_dlq_topic']
         
         # Initialize Kafka producer
         self.producer = None
@@ -1163,23 +1167,7 @@ class MultilingualMessageProcessor:
 
     async def _setup_elasticsearch_indices(self):
         """Setup Elasticsearch indices with proper mappings for vector search"""
-        # Original documents index
-        original_index = f"{self.es_config['tenant_document_index_name']}-originals"
-        exists = await self.es_client.indices.exists(index=original_index)
-        if not exists:
-            await self.es_client.indices.create(
-                index=original_index,
-                mappings={
-                    "properties": {
-                        "content": {"type": "text"},
-                        "tenantId": {"type": "keyword"},
-                        "documentId": {"type": "keyword"},
-                        "metadata": {"type": "object", "enabled": True}
-                    }
-                }
-            )
-            logger.info(f"Created originals index: {original_index}")
-        
+ 
         # Chunks index with vector field
         chunks_index = self.es_config['tenant_document_index_name']
         exists = await self.es_client.indices.exists(index=chunks_index)
@@ -1205,7 +1193,7 @@ class MultilingualMessageProcessor:
             )
             logger.info(f"Created chunks index: {chunks_index}")
 
-    async def process_message(self, message: Dict[str, Any]):
+    async def process_document_message(self, message: Dict[str, Any]):
         """
         Process an individual message and store it in Elasticsearch with vector embeddings.
         
@@ -1227,22 +1215,7 @@ class MultilingualMessageProcessor:
         if not language:
             language = self.detect_best_language(content)
             metadata['language'] = language
-        
-        # Store original document first (for reference)
-        original_doc = {
-            'content': content,
-            'tenantId': tenant_id,
-            'metadata': metadata,
-            'documentId': document_id
-        }
-        
-        await self.es_client.index(
-            index=f"{self.es_config['tenant_document_index_name']}-originals",
-            document=original_doc,
-            id=document_id
-        )
-        logger.info(f"Indexed original document with ID: {document_id}")
-        
+     
         # Extract semantic chunks with language awareness
         chunks = self.extract_chunks(content, language)
         logger.info(f"Extracted {len(chunks)} semantic chunks from document")
@@ -1300,10 +1273,7 @@ class MultilingualMessageProcessor:
             index=self.es_config['tenant_document_index_name'], 
             body=delete_query
         )
-        await self.es_client.delete_by_query(
-            index=f"{self.es_config['tenant_document_index_name']}-originals", 
-            body=delete_query
-        )
+
         
         logger.info(f"Deleted old inactive documents for tenant_id: {tenant_id}")
         
@@ -1319,6 +1289,132 @@ class MultilingualMessageProcessor:
         )
         
         logger.info(f"Successfully indexed all {len(chunks)} chunks for document {document_id}")
+
+
+    async def process_faq_message(self, message: Dict[str, Any]):
+        """
+        Process an individual message and store it in Elasticsearch with vector embeddings.
+        
+        Args:
+            message: Message dictionary containing content array and metadata.
+        """
+        # Extract message data
+        tenant_id = message.get('tenantId')
+        metadata = message.get('metadata', {}) or {}
+        content_records = message.get('content', []) or []
+        
+        # Track all document IDs for response
+        processed_faq_ids = set()
+        
+        # Process each content record in the array
+        for content in content_records:
+            faq_id = content.get('faqId')
+            if not faq_id:
+                logger.warning(f"Skipping record with missing faqId for tenant: {tenant_id}")
+                continue
+                
+            processed_faq_ids.add(faq_id)
+            record_metadata = metadata.copy()
+            record_metadata["faqId"] = faq_id
+            
+            question = content.get("question", "")
+            answer = content.get("answer", "")
+            link = content.get("link", "")
+            paraphrases = content.get('paraphrases', []) or []
+
+            # Check if language is specified in metadata, otherwise detect it
+            language = record_metadata.get('language')
+            if not language:
+                language = self.detect_best_language(question + " " + answer)
+                record_metadata['language'] = language
+            
+            # Process main question and answer
+            document_id = str(uuid.uuid4())
+            store = f"Question: {question} \n Answer: {answer} \n Link: {link}"
+            
+            # Generate vector embedding for the chunk
+            vector = self.st_model.encode(store).tolist()
+            
+            # Prepare chunk document
+            document = {
+                'content': store,
+                'contentVector': vector,
+                'tenantId': tenant_id,
+                'documentId': document_id,
+                'chunkType': "faq",
+                'sectionTitle': "faq",
+                'metadata': record_metadata
+            }
+                
+            # Index the chunk
+            await self.es_client.index(
+                index=self.es_config['tenant_document_index_name'],
+                document=document,
+                id=document_id
+            )
+            
+            # Process each paraphrase
+            for paraphrase in paraphrases:
+                paraphrase_id = str(uuid.uuid4())
+                store = f"Question: {paraphrase} \n Answer: {answer} \n Link: {link}"
+                
+                # Generate vector embedding for the paraphrase
+                vector = self.st_model.encode(store).tolist()
+                
+                # Prepare paraphrase document
+                document = {
+                    'content': store,
+                    'contentVector': vector,
+                    'tenantId': tenant_id,
+                    'documentId': paraphrase_id,
+                    'chunkType': "faq",
+                    'sectionTitle': "faq",
+                    'metadata': record_metadata
+                }
+                    
+                # Index the paraphrase
+                await self.es_client.index(
+                    index=self.es_config['tenant_document_index_name'],
+                    document=document,
+                    id=paraphrase_id
+                )
+        
+        # Delete old inactive documents for this tenant
+        delete_query = {
+            "query": {
+                "bool": {
+                    "must": [
+                        {"term": {"tenantId": tenant_id}},
+                        {"term": {"metadata.inactive": True}}
+                    ]
+                }
+            }
+        }
+        
+        # Delete from the index
+        await self.es_client.delete_by_query(
+            index=self.es_config['tenant_document_index_name'], 
+            body=delete_query
+        )
+        
+        logger.info(f"Deleted old inactive documents for tenant_id: {tenant_id}")
+        
+        # Send success response - using the set of all processed FAQ IDs
+        for faq_id in processed_faq_ids:
+            await self.publish_kafka_message(
+                self.response_topic,
+                tenant_id,
+                DataStorageDto(
+                    tenantId=tenant_id,
+                    documentId=faq_id,
+                    status='success'
+                )
+            )
+        
+        logger.info(f"Successfully indexed {len(processed_faq_ids)} FAQs for tenant: {tenant_id}")
+        
+
+
 
     async def publish_kafka_message(self, topic: str, key: str, message: Any):
         """
@@ -1359,7 +1455,7 @@ class MultilingualMessageProcessor:
         
         return await future
 
-    async def send_to_dead_letter_queue(self, message: Dict[str, Any], error: str):
+    async def send_to_dead_letter_queue(self, dlq_topic: str, message: Dict[str, Any], error: str):
         """
         Send problematic messages to a dead letter topic.
         
@@ -1374,7 +1470,7 @@ class MultilingualMessageProcessor:
         }
         
         await self.publish_kafka_message(
-            self.dlq_topic,
+           dlq_topic,
             message.get('tenantId', 'unknown'),
             error_message
         )
@@ -1406,47 +1502,7 @@ class MultilingualMessageProcessor:
         else:
             return {"raw_content": str(message_value)}
 
-    async def consume_messages(self):
-        """Consume messages from Kafka queue and process them."""
-        consumer = Consumer(self.consumer_config)
-        
-        try:
-            # Subscribe to topic
-            consumer.subscribe([self.request_topic])
-            logger.info(f"Subscribed to topic: {self.request_topic}")
-            
-            while True:
-                msg = consumer.poll(1.0)
-                if msg is None:
-                    continue
-                
-                if msg.error():
-                    if msg.error().code() == KafkaException._PARTITION_EOF:
-                        logger.info(f"Reached end of partition {msg.partition()}")
-                    else:
-                        logger.error(f"Error: {msg.error()}")
-                    continue
-                
-                # Process message
-                try:
-                    value = self._parse_message(msg.value())
-                    
-                    logger.info(f"Received message from partition {msg.partition()}, offset {msg.offset()}")
-                    await self.process_message(value)
-                    
-                except Exception as e:
-                    logger.error(f"Error processing message: {str(e)}", exc_info=True)
-                    await self.send_to_dead_letter_queue(
-                        self._parse_message(msg.value()) if msg.value() else {},
-                        str(e)
-                    )
-                    
-        except KeyboardInterrupt:
-            pass
-        finally:
-            # Close the consumer
-            consumer.close()
-            logger.info("Kafka consumer closed")
+
 
     async def run(self):
         """Main processing loop."""
@@ -1459,9 +1515,87 @@ class MultilingualMessageProcessor:
         # Setup Elasticsearch indices
         await self._setup_elasticsearch_indices()
         
-        # Start consuming messages
+        # Create separate methods for the consumer loops without their own exception handling
+        async def document_consumer_loop():
+            consumer = Consumer(self.consumer_config)
+            consumer.subscribe([self.document_request_topic])
+            logger.info(f"Subscribed to topic: {self.document_request_topic}")
+            
+            try:
+                while True:
+                    msg = consumer.poll(1.0)
+                    if msg is None:
+                        await asyncio.sleep(0.1)  # Small delay to prevent CPU spinning
+                        continue
+                    
+                    if msg.error():
+                        if msg.error().code() == KafkaException._PARTITION_EOF:
+                            logger.info(f"Reached end of partition {msg.partition()}")
+                        else:
+                            logger.error(f"Error: {msg.error()}")
+                        continue
+                    
+                    # Process message
+                    try:
+                        value = self._parse_message(msg.value())
+                        logger.info(f"Received document message from partition {msg.partition()}, offset {msg.offset()}")
+                        await self.process_document_message(value)
+                        
+                    except Exception as e:
+                        logger.error(f"Error processing message: {str(e)}", exc_info=True)
+                        await self.send_to_dead_letter_queue(
+                            self.document_dlq_topic,
+                            self._parse_message(msg.value()) if msg.value() else {},
+                            str(e)
+                        )
+            finally:
+                consumer.close()
+                logger.info("Document Kafka consumer closed")
+        
+        async def faq_consumer_loop():
+            consumer = Consumer(self.consumer_config)
+            consumer.subscribe([self.faq_request_topic])
+            logger.info(f"Subscribed to topic: {self.faq_request_topic}")
+            
+            try:
+                while True:
+                    msg = consumer.poll(1.0)
+                    if msg is None:
+                        await asyncio.sleep(0.1)  # Small delay to prevent CPU spinning
+                        continue
+                    
+                    if msg.error():
+                        if msg.error().code() == KafkaException._PARTITION_EOF:
+                            logger.info(f"Reached end of partition {msg.partition()}")
+                        else:
+                            logger.error(f"Error: {msg.error()}")
+                        continue
+                    
+                    # Process message
+                    try:
+                        value = self._parse_message(msg.value())
+                        logger.info(f"Received FAQ message from partition {msg.partition()}, offset {msg.offset()}")
+                        await self.process_faq_message(value)
+                        
+                    except Exception as e:
+                        logger.error(f"Error processing message: {str(e)}", exc_info=True)
+                        await self.send_to_dead_letter_queue(
+                            self.faq_dlq_topic,
+                            self._parse_message(msg.value()) if msg.value() else {},
+                            str(e)
+                        )
+            finally:
+                consumer.close()
+                logger.info("FAQ Kafka consumer closed")
+        
+        # Start consuming messages concurrently with a single exception handler
         try:
-            await self.consume_messages()
+            await asyncio.gather(
+                document_consumer_loop(),
+                faq_consumer_loop()
+            )
+        except KeyboardInterrupt:
+            logger.info("Keyboard interrupt received, shutting down...")
         except Exception as e:
             logger.error(f"Fatal error in main loop: {str(e)}", exc_info=True)
         finally:

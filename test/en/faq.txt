@@ -1,0 +1,29 @@
+#QA_SECTION: Customer Account Questions
+
+Q: How do I create a new account?
+A: To create a new account, visit our website and click on the "Sign Up" button in the top right corner. You'll need to provide your email address and create a password. We'll send a verification email to complete the process.
+
+Q: How can I reset my password?
+A: You can reset your password by clicking on the "Forgot Password" link on the login page. Enter your email address, and we'll send you instructions to create a new password.
+
+Q: Can I have multiple users on one account?
+A: Yes, our Business and Enterprise plans support multiple users. The account administrator can add new users by going to "Account Settings" > "User Management" and clicking "Add User."
+
+#QA_SECTION: Billing and Payments
+
+Q: What payment methods do you accept?
+A: We accept all major credit cards (Visa, Mastercard, American Express), PayPal, and bank transfers for annual subscriptions.
+
+Q: How often will I be billed?
+A: Billing occurs monthly or annually, depending on the subscription plan you choose. Annual plans include a 15% discount.
+
+Q: Is there an automatic renewal?
+A: Yes, subscriptions automatically renew at the end of your billing period unless you cancel through your account settings.
+
+#QA_SECTION: Product Features
+
+Q: Does your platform work on mobile devices?
+A: Yes, our platform is fully responsive and works on all modern smartphones and tablets. We also offer dedicated mobile apps for iOS and Android.
+
+Q: What file formats can I import?
+A: Our system supports imports from CSV, XLS, XLSX, JSON, and XML formats. The maximum file size is 50MB.
