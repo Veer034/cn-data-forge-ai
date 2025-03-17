@@ -7,7 +7,7 @@ import uuid
 from typing import List, Dict, Any, Optional, Tuple, Set
 from sentence_transformers import SentenceTransformer
 from elasticsearch import AsyncElasticsearch
-from confluent_kafka import Consumer, Producer, KafkaException
+from confluent_kafka import Consumer, Producer, KafkaError
 from pydantic import BaseModel
 from config import KAFKA_CONFIG,ES_CONFIG
 from libaryLanguage import LibraryLanguageDetector
@@ -23,7 +23,7 @@ logger = logging.getLogger(__name__)
 
 class DataStorageDto(BaseModel):
     tenantId: str
-    storedIds: Set[str]
+    storedIds: List[str] 
     isDone: bool
     dataType: str
 
@@ -1284,7 +1284,7 @@ class MultilingualMessageProcessor:
             tenant_id,
             DataStorageDto(
                 tenantId=tenant_id,
-                storedIds= set(document_id),
+                storedIds= list({document_id}),
                 isDone= True,
                 dataType='doc'
             )
@@ -1408,7 +1408,7 @@ class MultilingualMessageProcessor:
             tenant_id,
             DataStorageDto(
                 tenantId=tenant_id,
-                storedIds=processed_faq_ids,
+                storedIds=list(processed_faq_ids),
                 isDone=True,
                 dataType ='faq'
             )
@@ -1435,10 +1435,20 @@ class MultilingualMessageProcessor:
         serialized_key = str(key).encode("utf-8")
         
         if isinstance(message, BaseModel):
-            serialized_value = json.dumps(message.model_dump()).encode("utf-8")
+            # Custom encoder that can handle sets
+            def set_encoder(obj):
+                if isinstance(obj, set):
+                    return list(obj)
+                raise TypeError(f"Object of type {type(obj)} is not JSON serializable")
+            
+            serialized_value = json.dumps(message.model_dump(), default=set_encoder).encode("utf-8")
         else:
-            serialized_value = json.dumps(message).encode("utf-8")
-        
+            def set_encoder(obj):
+                if isinstance(obj, set):
+                    return list(obj)
+                raise TypeError(f"Object of type {type(obj)} is not JSON serializable")
+            
+            serialized_value = json.dumps(message, default=set_encoder).encode("utf-8")
         # Create an asyncio Future to wait for delivery report
         future = asyncio.Future()
         
@@ -1471,7 +1481,7 @@ class MultilingualMessageProcessor:
         epoch_timestamp = int(datetime.datetime.now().timestamp())
     
         error_message = {
-            "original_message": message,
+            "originalMessage": message,
             "error": error,
             "eventTime": epoch_timestamp
         }
@@ -1536,7 +1546,8 @@ class MultilingualMessageProcessor:
                         continue
                     
                     if msg.error():
-                        if msg.error().code() == KafkaException._PARTITION_EOF:
+                        # Replace the incorrect KafkaException._PARTITION_EOF with the correct error code
+                        if msg.error().code() == KafkaError._PARTITION_EOF:
                             logger.info(f"Reached end of partition {msg.partition()}")
                         else:
                             logger.error(f"Error: {msg.error()}")
@@ -1558,7 +1569,7 @@ class MultilingualMessageProcessor:
             finally:
                 consumer.close()
                 logger.info("Document Kafka consumer closed")
-        
+
         async def faq_consumer_loop():
             consumer = Consumer(self.consumer_config)
             consumer.subscribe([self.faq_request_topic])
@@ -1572,7 +1583,8 @@ class MultilingualMessageProcessor:
                         continue
                     
                     if msg.error():
-                        if msg.error().code() == KafkaException._PARTITION_EOF:
+                        # Replace the incorrect KafkaException._PARTITION_EOF with the correct error code
+                        if msg.error().code() == KafkaError._PARTITION_EOF:
                             logger.info(f"Reached end of partition {msg.partition()}")
                         else:
                             logger.error(f"Error: {msg.error()}")
@@ -1593,8 +1605,8 @@ class MultilingualMessageProcessor:
                         )
             finally:
                 consumer.close()
-                logger.info("FAQ Kafka consumer closed")
-        
+                logger.info("FAQ Kafka consumer closed") 
+
         # Start consuming messages concurrently with a single exception handler
         try:
             await asyncio.gather(
