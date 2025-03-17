@@ -23,8 +23,9 @@ logger = logging.getLogger(__name__)
 
 class DataStorageDto(BaseModel):
     tenantId: str
-    documentId: str
-    status: str
+    storedIds: Set[str]
+    isDone: bool
+    dataType: str
 
 class ChunkMetadata(BaseModel):
     hasQuestion: bool = False
@@ -1283,8 +1284,9 @@ class MultilingualMessageProcessor:
             tenant_id,
             DataStorageDto(
                 tenantId=tenant_id,
-                documentId=document_id,
-                status='success'
+                storedIds= set(document_id),
+                isDone= True,
+                dataType='doc'
             )
         )
         
@@ -1400,16 +1402,18 @@ class MultilingualMessageProcessor:
         logger.info(f"Deleted old inactive documents for tenant_id: {tenant_id}")
         
         # Send success response - using the set of all processed FAQ IDs
-        for faq_id in processed_faq_ids:
-            await self.publish_kafka_message(
-                self.response_topic,
-                tenant_id,
-                DataStorageDto(
-                    tenantId=tenant_id,
-                    documentId=faq_id,
-                    status='success'
-                )
+        
+        await self.publish_kafka_message(
+            self.response_topic,
+            tenant_id,
+            DataStorageDto(
+                tenantId=tenant_id,
+                storedIds=processed_faq_ids,
+                isDone=True,
+                dataType ='faq'
             )
+        )
+            
         
         logger.info(f"Successfully indexed {len(processed_faq_ids)} FAQs for tenant: {tenant_id}")
         
@@ -1463,10 +1467,13 @@ class MultilingualMessageProcessor:
             message: Original message.
             error: Error description.
         """
+         # Use epoch timestamp (seconds since epoch) instead of formatted datetime string
+        epoch_timestamp = int(datetime.datetime.now().timestamp())
+    
         error_message = {
             "original_message": message,
             "error": error,
-            "timestamp": str(datetime.datetime.now())
+            "eventTime": epoch_timestamp
         }
         
         await self.publish_kafka_message(
