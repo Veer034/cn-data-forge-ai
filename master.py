@@ -4,6 +4,11 @@ import logging
 import asyncio
 import datetime
 import uuid
+import os
+import signal
+import sys
+from pathlib import Path
+from logging.handlers import RotatingFileHandler
 from typing import List, Dict, Any, Optional, Tuple, Set
 from sentence_transformers import SentenceTransformer
 from elasticsearch import AsyncElasticsearch
@@ -12,14 +17,6 @@ from pydantic import BaseModel
 from config import KAFKA_CONFIG,ES_CONFIG
 from libaryLanguage import LibraryLanguageDetector
 
-
-
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
-)
-logger = logging.getLogger(__name__)
 
 class DataStorageDto(BaseModel):
     tenantId: str
@@ -42,6 +39,9 @@ class Chunk(BaseModel):
     type: str
     metadata: ChunkMetadata
 
+from logger_config import get_logger
+logger = get_logger(__name__)
+
 class MultilingualMessageProcessor:
     
     def __init__(self, es_config: Dict[str, Any], kafka_config: Dict[str, Any], model_path: Optional[str] = None):
@@ -53,6 +53,12 @@ class MultilingualMessageProcessor:
             kafka_config: Kafka configuration.
             model_path: Optional path to a local SentenceTransformer model.
         """
+
+        # Setup signal handlers for graceful shutdown
+        self.shutdown_requested = False
+        signal.signal(signal.SIGTERM, self._signal_handler)
+        signal.signal(signal.SIGINT, self._signal_handler)
+        
         self.es_config = es_config
         self.kafka_config = kafka_config
         
@@ -1525,6 +1531,11 @@ class MultilingualMessageProcessor:
         """Main processing loop."""
         logger.info("Starting multilingual message processor...")
         
+
+        # Get port from environment variable, default to 9000
+        port = int(os.getenv("SERVICE_PORT", 9001))
+        logger.info(f"Service configured for port: {port}")
+
         # Initialize producer
         self.producer = Producer(self.producer_config)
         logger.info("Kafka producer initialized successfully")
@@ -1539,7 +1550,7 @@ class MultilingualMessageProcessor:
             logger.info(f"Subscribed to topic: {self.document_request_topic}")
             
             try:
-                while True:
+                while not self.shutdown_requested:
                     msg = consumer.poll(1.0)
                     if msg is None:
                         await asyncio.sleep(0.1)  # Small delay to prevent CPU spinning
@@ -1576,7 +1587,7 @@ class MultilingualMessageProcessor:
             logger.info(f"Subscribed to topic: {self.faq_request_topic}")
             
             try:
-                while True:
+                while not self.shutdown_requested:
                     msg = consumer.poll(1.0)
                     if msg is None:
                         await asyncio.sleep(0.1)  # Small delay to prevent CPU spinning
@@ -1632,8 +1643,6 @@ class MultilingualMessageProcessor:
             self.producer.flush()
         
         logger.info("Resources closed.")
-
-
 
 
 # Example usage

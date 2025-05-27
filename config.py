@@ -4,7 +4,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 KAFKA_CONFIG = {
-    'bootstrap_servers': os.getenv('KAFKA_BOOTSTRAP_SERVERS', "localhost:9092,broker:29092"),
+    'bootstrap_servers': os.getenv('KAFKA_BOOTSTRAP_SERVERS', '57.159.53.43:9092,20.244.2.74:9092,4.240.100.104:9092'),
     'group_id':'vector_processor',
     'document_storage_request_topic': os.getenv('TENANT_DOCUMENTS_VECTOR_STORAGE_REQUEST_TOPIC', 'tenant.documents.vector.storage.request'),
     'document_storage_request_dlq_topic': os.getenv('TENANT_DOCUMENTS_VECTOR_STORAGE_REQUEST_DLQ_TOPIC', 'tenant.documents.vector.storage.request_DLQ'),
@@ -14,6 +14,6 @@ KAFKA_CONFIG = {
 }
 
 ES_CONFIG = {
-    'hosts': os.getenv('ES_HOSTS', 'http://localhost:9200'),
+    'hosts': os.getenv('ES_HOSTS', '57.159.53.43:9200,20.244.2.74:9200,4.240.100.104:9200'),
     'tenant_document_index_name': os.getenv('ES_TENANT_DOCUMENTS_VECTOR_INDEX_NAME', 'tenant-documents-vector')
 }

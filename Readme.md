@@ -1,3 +1,7 @@
+About
+
+    DataForge AI symbolizes an AI system that processes, structures, and refines data to generate intelligent responses. It suggests a powerful, industrial-grade AI that forges knowledge from data, making it great for vector search, document processing, and AI-driven insights.
+
 Yes! Your setup should have two models:
 
 1️⃣ **For Sentence Embeddings & FAQ Matching (Vector Storage in Elasticsearch)**  

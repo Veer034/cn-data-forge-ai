@@ -6,7 +6,10 @@ import logging
 import os
 import importlib.util
 
-logger = logging.getLogger(__name__)
+from logger_config import get_logger
+logger = get_logger(__name__)
+
+# Now all your logger.info() calls will work correctly
 
 class LibraryLanguageDetector:
     def __init__(self, use_libraries=True):
