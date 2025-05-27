@@ -168,6 +168,12 @@ class MultilingualMessageProcessor:
         self.POLICY_TERMS = self._initialize_policy_terms()
         self.QA_MARKERS = self._initialize_qa_markers()
 
+    def _signal_handler(self, sig, frame):
+        """Handle shutdown signals gracefully"""
+        self.logger.info(f"Received signal {sig}, initiating graceful shutdown...")
+        self.shutdown_requested = True
+
+
     def _initialize_section_headers(self) -> Dict[str, List[str]]:
         """Initialize section header terms for different languages"""
         headers = {

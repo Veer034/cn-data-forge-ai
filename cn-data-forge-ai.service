@@ -1,0 +1,20 @@
+sudo tee /etc/systemd/system/cn-data-forge-ai-service.service > /dev/null << EOF
+[Unit]
+Description=For data forging
+After=network.target ollama.service
+Requires=ollama.service
+
+[Service]
+Type=simple
+User=azureuser
+WorkingDirectory=/home/azureuser/cn-data-forge-ai
+Environment=PATH=/home/azureuser/cn-data-forge-ai/myvenv/bin
+ExecStart=/home/azureuser/cn-data-forge-ai/myvenv/bin/python master.py
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+EOF

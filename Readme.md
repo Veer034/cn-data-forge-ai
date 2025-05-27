@@ -136,6 +136,130 @@ deactivate your virtual environment if it's active:
 
     deactivate
 
+# Production Setup
+
+### Login VM
+
+    ssh azureuser@YOUR-VM-PUBLIC-IP
+
+### Install Git
+
+    sudo apt update
+    sudo apt install git -y
+    git clone https://github.com/Veer034/cn-data-forge-ai.git
+
+### Install Python
+
+    sudo add-apt-repository ppa:deadsnakes/ppa -y
+    sudo apt update
+    sudo apt install python3.10 python3.10-venv python3.10-distutils
+
+### Activiate Env
+
+    #can change the env names
+    python3.10 -m venv myvenv
+    source myvenv/bin/activate
+
+    #make sure version is 3.10.*
+    python --version
+
+### Install library in production VM
+
+    pip install "numpy<2.0.0" aiohttp sentence-transformers elasticsearch confluent-kafka httpx nltk python-dotenv transformers langdetect pydantic
+
+    # Install all required build tools and dependencies for language libraries
+    sudo apt update
+    sudo apt install -y \
+        build-essential \
+        g++ \
+        gcc \
+        python3-dev \
+        libicu-dev \
+        pkg-config \
+        cmake \
+        make \
+        git \
+        libc6-dev \
+        linux-headers-generic
+
+    # Install additional tools that FastText needs
+    sudo apt install -y \
+        software-properties-common \
+        apt-transport-https \
+        ca-certificates \
+        gnupg \
+        lsb-release
+
+    # Check current GCC version
+    gcc --version
+
+    # If GCC is older than 7.x, update it
+    sudo apt install -y gcc-9 g++-9
+    sudo update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-9 60
+    sudo update-alternatives --install /usr/bin/g++ g++ /usr/bin/g++-9 60
+
+    # Ensure pip build tools are up to date
+    pip install --upgrade pip setuptools wheel
+    pip install --upgrade build
+
+    #For language detection
+    pip install langdetect fasttext lingua-language-detector pycld2 polyglot pyicu morfessor
+
+### Create Systemd file for as a service execution
+
+    sudo tee /etc/systemd/system/cn-data-forge-ai-service.service > /dev/null << EOF
+    [Unit]
+    Description=For data forging
+    After=network.target ollama.service
+    Requires=ollama.service
+
+    [Service]
+    Type=simple
+    User=azureuser
+    WorkingDirectory=/home/azureuser/cn-data-forge-ai
+    Environment=PATH=/home/azureuser/cn-data-forge-ai/myvenv/bin
+    ExecStart=/home/azureuser/cn-data-forge-ai/myvenv/bin/python master.py
+    Restart=always
+    RestartSec=10
+    StandardOutput=journal
+    StandardError=journal
+
+    [Install]
+    WantedBy=multi-user.target
+    EOF
+
+### Reload systemd
+
+    sudo systemctl daemon-reload
+
+### Enable all services to start on boot
+
+    sudo systemctl enable cn-data-forge-ai-service
+
+### Start Service
+
+    sudo systemctl start cn-data-forge-ai-service
+
+### Check Status
+
+    sudo systemctl status cn-data-forge-ai-service
+
+### Stop service
+
+    sudo systemctl stop cn-data-forge-ai-service
+
+### Restart service
+
+    sudo systemctl restart cn-data-forge-ai-service
+
+### Check logs for specific service
+
+    sudo journalctl -u cn-data-forge-ai-service -f
+
+### Check service generated logs
+
+    tail -n 50 /cn-data-forge-ai/logs/server.log
+
 Kafka input formt:
 
     {
