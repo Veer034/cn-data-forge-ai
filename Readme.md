@@ -228,6 +228,10 @@ deactivate your virtual environment if it's active:
     WantedBy=multi-user.target
     EOF
 
+### HuggingFace model storage location
+
+    ~/.cache/huggingface/
+
 ### Reload systemd
 
     sudo systemctl daemon-reload
@@ -258,7 +262,23 @@ deactivate your virtual environment if it's active:
 
 ### Check service generated logs
 
-    tail -n 50 /cn-data-forge-ai/logs/server.log
+    tail -n 50 ~/cn-data-forge-ai/logs/server.log
+
+### List all topics
+
+kafka-topics.sh --list --bootstrap-server 57.159.53.43:9092
+
+### Describe a specific topic
+
+kafka-topics.sh --describe --topic tenant.documents.vector.storage.request --bootstrap-server 57.159.53.43:9092
+
+### Describe all topics
+
+kafka-topics.sh --describe --bootstrap-server 57.159.53.43:9092
+
+### Describe multiple specific topics
+
+kafka-topics.sh --describe --topic tenant.documents.vector.storage.request,tenant.faq.vector.storage.request --bootstrap-server 57.159.53.43:9092
 
 Kafka input formt:
 
