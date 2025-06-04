@@ -198,7 +198,7 @@ deactivate your virtual environment if it's active:
 
 ### Create Systemd file for as a service execution
 
-    sudo tee /etc/systemd/system/cn-data-forge-ai-service.service > /dev/null << EOF
+    sudo tee /etc/systemd/system/cn-data-forge-ai.service > /dev/null << EOF
     [Unit]
     Description=For data forging
     After=network.target ollama.service
@@ -229,27 +229,27 @@ deactivate your virtual environment if it's active:
 
 ### Enable all services to start on boot
 
-    sudo systemctl enable cn-data-forge-ai-service
+    sudo systemctl enable cn-data-forge-ai
 
 ### Start Service
 
-    sudo systemctl start cn-data-forge-ai-service
+    sudo systemctl start cn-data-forge-ai
 
 ### Check Status
 
-    sudo systemctl status cn-data-forge-ai-service
+    sudo systemctl status cn-data-forge-ai
 
 ### Stop service
 
-    sudo systemctl stop cn-data-forge-ai-service
+    sudo systemctl stop cn-data-forge-ai
 
 ### Restart service
 
-    sudo systemctl restart cn-data-forge-ai-service
+    sudo systemctl restart cn-data-forge-ai
 
 ### Check logs for specific service
 
-    sudo journalctl -u cn-data-forge-ai-service -f
+    sudo journalctl -u cn-data-forge-ai -f
 
 ### Check service generated logs
 
