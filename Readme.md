@@ -154,15 +154,6 @@ deactivate your virtual environment if it's active:
     sudo apt update
     sudo apt install python3.10 python3.10-venv python3.10-distutils
 
-### Activiate Env
-
-    #can change the env names
-    python3.10 -m venv myvenv
-    source myvenv/bin/activate
-
-    #make sure version is 3.10.*
-    python --version
-
 ### Install library in production VM
 
     pip install "numpy<2.0.0" aiohttp sentence-transformers elasticsearch confluent-kafka httpx nltk python-dotenv transformers langdetect pydantic
@@ -267,6 +258,10 @@ deactivate your virtual environment if it's active:
 ### List all topics
 
 kafka-topics.sh --list --bootstrap-server 57.159.53.43:9092
+
+### Create a specific topic
+
+kafka-topics.sh --create --topic my-topic --bootstrap-server 57.159.53.43:9092
 
 ### Describe a specific topic
 

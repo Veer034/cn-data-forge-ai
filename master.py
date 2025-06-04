@@ -55,38 +55,63 @@ class MultilingualMessageProcessor:
         """
 
         # Setup signal handlers for graceful shutdown
+        logger.info("=" * 60)
+        logger.info("INITIALIZING MULTILINGUAL MESSAGE PROCESSOR")
+        logger.info("=" * 60)
+
+        # Setup signal handlers for graceful shutdown
         self.shutdown_requested = False
         signal.signal(signal.SIGTERM, self._signal_handler)
         signal.signal(signal.SIGINT, self._signal_handler)
+        logger.info("✓ Signal handlers configured for graceful shutdown")
         
         self.es_config = es_config
         self.kafka_config = kafka_config
         
         # Initialize SentenceTransformer with multilingual model
+        logger.info("Initializing SentenceTransformer model...")
         model_name = 'paraphrase-multilingual-mpnet-base-v2'
         try:
             if model_path:
                 logger.info(f"Loading model from local path: {model_path}")
                 self.st_model = SentenceTransformer(model_path)
+                logger.info("✓ SentenceTransformer model loaded successfully from local path")
             else:
-                logger.info(f"Loading model {model_name} from Hugging Face")
+                logger.info(f"Loading model '{model_name}' from Hugging Face...")
                 self.st_model = SentenceTransformer(model_name)
+                logger.info("✓ SentenceTransformer model loaded successfully from Hugging Face")
         except Exception as e:
-            logger.error(f"Error loading sentence transformer model: {e}")
+            logger.error(f"✗ CRITICAL: Failed to load SentenceTransformer model: {e}")
+            logger.error("System cannot proceed without the model. Shutting down...")
             raise
             
-        # Initialize async Elasticsearch client
-        self.es_client = AsyncElasticsearch(
-            es_config['hosts'],
-            basic_auth=(es_config['username'], es_config['password']),
-            verify_certs=es_config.get('verify_certs', True),
-            ssl_show_warn=es_config.get('ssl_show_warn', True),
-            ca_certs=es_config.get('ca_certs'),  # Add this line
-            retry_on_timeout=True,
-            max_retries=3
-        )
+
+         # Initialize async Elasticsearch client
+        logger.info("Initializing Elasticsearch connection...")
+        logger.info(f"Elasticsearch hosts: {es_config['hosts']}")
+        logger.info(f"Elasticsearch username: {es_config['username']}")
+        logger.info(f"Elasticsearch SSL verification: {es_config.get('verify_certs', True)}")
+        
+        try:
+            self.es_client = AsyncElasticsearch(
+                es_config['hosts'],
+                basic_auth=(es_config['username'], es_config['password']),
+                verify_certs=es_config.get('verify_certs', True),
+                ssl_show_warn=es_config.get('ssl_show_warn', True),
+                ca_certs=es_config.get('ca_certs'),
+                retry_on_timeout=True,
+                max_retries=3
+            )
+            logger.info("✓ Elasticsearch client initialized successfully")
+        except Exception as e:
+            logger.error(f"✗ CRITICAL: Failed to initialize Elasticsearch client: {e}")
+            raise
         
         # Kafka configuration
+        logger.info("Configuring Kafka connections...")
+        logger.info(f"Kafka bootstrap servers: {kafka_config['bootstrap_servers']}")
+        logger.info(f"Kafka consumer group ID: {kafka_config['group_id']}")
+        
         self.consumer_config = {
             'bootstrap.servers': kafka_config['bootstrap_servers'],
             'group.id': kafka_config['group_id'],
@@ -101,6 +126,7 @@ class MultilingualMessageProcessor:
             'bootstrap.servers': kafka_config['bootstrap_servers']
         }
         
+        
         # Kafka topics
         self.document_request_topic = kafka_config['document_storage_request_topic']
         self.document_dlq_topic = kafka_config['document_storage_request_dlq_topic']
@@ -109,10 +135,25 @@ class MultilingualMessageProcessor:
         self.faq_dlq_topic = kafka_config['faq_storage_request_dlq_topic']
         self.response_topic = kafka_config['vector_storage_response_topic']
         
+        logger.info("Kafka topics configured:")
+        logger.info(f"  - Document request topic: {self.document_request_topic}")
+        logger.info(f"  - Document DLQ topic: {self.document_dlq_topic}")
+        logger.info(f"  - FAQ request topic: {self.faq_request_topic}")
+        logger.info(f"  - FAQ DLQ topic: {self.faq_dlq_topic}")
+        logger.info(f"  - Response topic: {self.response_topic}")
+
         # Initialize Kafka producer
         self.producer = None
 
-        self.libraryDetector = LibraryLanguageDetector()
+        logger.info("Initializing language detector...")
+        try:
+            self.libraryDetector = LibraryLanguageDetector()
+            logger.info("✓ Language detector initialized successfully")
+        except Exception as e:
+            logger.error(f"✗ Failed to initialize language detector: {e}")
+            logger.warning("Proceeding without language detector - some features may be limited")
+
+
 
         # Define language script groupings
         self.SCRIPT_GROUPS = {
@@ -173,7 +214,7 @@ class MultilingualMessageProcessor:
 
     def _signal_handler(self, sig, frame):
         """Handle shutdown signals gracefully"""
-        self.logger.info(f"Received signal {sig}, initiating graceful shutdown...")
+        logger.info(f"Received signal {sig}, initiating graceful shutdown...")
         self.shutdown_requested = True
 
 
@@ -1535,129 +1576,265 @@ class MultilingualMessageProcessor:
             return {"raw_content": str(message_value)}
 
 
+    async def _test_elasticsearch_connection(self) -> bool:
+        """Test Elasticsearch connectivity and health"""
+        logger.info("Testing Elasticsearch connection...")
+        try:
+            # Test basic connectivity
+            info = await self.es_client.info()
+            logger.info(f"✓ Elasticsearch connection successful")
+            logger.info(f"  - Cluster name: {info.get('cluster_name', 'unknown')}")
+            logger.info(f"  - Version: {info.get('version', {}).get('number', 'unknown')}")
+            
+            # Test cluster health
+            health = await self.es_client.cluster.health()
+            status = health.get('status', 'unknown')
+            logger.info(f"  - Cluster status: {status}")
+            
+            if status in ['green', 'yellow']:
+                logger.info("✓ Elasticsearch cluster is healthy")
+                return True
+            else:
+                logger.warning(f"⚠ Elasticsearch cluster status is: {status}")
+                return False
+                
+        except Exception as e:
+            logger.error(f"✗ Elasticsearch connection test failed: {e}")
+            return False
+
+    async def _test_kafka_connectivity(self) -> bool:
+        """Test Kafka connectivity"""
+        logger.info("Testing Kafka connectivity...")
+        
+        # Test producer connectivity
+        try:
+            test_producer = Producer(self.producer_config)
+            # Get metadata to test connectivity
+            metadata = test_producer.list_topics(timeout=10)
+            logger.info(f"✓ Kafka producer connection successful")
+            logger.info(f"  - Available topics: {len(metadata.topics)} topics found")
+            
+            # Check if our required topics exist
+            available_topics = set(metadata.topics.keys())
+            required_topics = {
+                self.document_request_topic,
+                self.document_dlq_topic,
+                self.faq_request_topic,
+                self.faq_dlq_topic,
+                self.response_topic
+            }
+            
+            missing_topics = required_topics - available_topics
+            if missing_topics:
+                logger.warning(f"⚠ Missing required topics: {missing_topics}")
+                logger.warning("Topics will be auto-created if Kafka allows it")
+            else:
+                logger.info("✓ All required Kafka topics are available")
+            
+            test_producer.flush()
+            return True
+            
+        except Exception as e:
+            logger.error(f"✗ Kafka connectivity test failed: {e}")
+            return False
+
+
 
     async def run(self):
-        """Main processing loop."""
-        logger.info("Starting multilingual message processor...")
+        """Main processing loop with comprehensive startup checks."""
+        logger.info("=" * 60)
+        logger.info("STARTING MULTILINGUAL MESSAGE PROCESSOR")
+        logger.info("=" * 60)
         
-
-        # Get port from environment variable, default to 9000
-        port = int(os.getenv("SERVICE_PORT", 9001))
-        logger.info(f"Service configured for port: {port}")
-
-        # Initialize producer
-        self.producer = Producer(self.producer_config)
-        logger.info("Kafka producer initialized successfully")
+        startup_success = True
         
-        # Setup Elasticsearch indices
-        await self._setup_elasticsearch_indices()
-        
-        # Create separate methods for the consumer loops without their own exception handling
-        async def document_consumer_loop():
-            consumer = Consumer(self.consumer_config)
-            consumer.subscribe([self.document_request_topic])
-            logger.info(f"Subscribed to topic: {self.document_request_topic}")
-            
-            try:
-                while not self.shutdown_requested:
-                    msg = consumer.poll(1.0)
-                    if msg is None:
-                        await asyncio.sleep(0.1)  # Small delay to prevent CPU spinning
-                        continue
-                    
-                    if msg.error():
-                        # Replace the incorrect KafkaException._PARTITION_EOF with the correct error code
-                        if msg.error().code() == KafkaError._PARTITION_EOF:
-                            logger.info(f"Reached end of partition {msg.partition()}")
-                        else:
-                            logger.error(f"Error: {msg.error()}")
-                        continue
-                    
-                    # Process message
-                    try:
-                        value = self._parse_message(msg.value())
-                        logger.info(f"Received document message from partition {msg.partition()}, offset {msg.offset()}")
-                        await self.process_document_message(value)
-                        
-                    except Exception as e:
-                        logger.error(f"Error processing message: {str(e)}", exc_info=True)
-                        await self.send_to_dead_letter_queue(
-                            self.document_dlq_topic,
-                            self._parse_message(msg.value()) if msg.value() else {},
-                            str(e)
-                        )
-            finally:
-                consumer.close()
-                logger.info("Document Kafka consumer closed")
-
-        async def faq_consumer_loop():
-            consumer = Consumer(self.consumer_config)
-            consumer.subscribe([self.faq_request_topic])
-            logger.info(f"Subscribed to topic: {self.faq_request_topic}")
-            
-            try:
-                while not self.shutdown_requested:
-                    msg = consumer.poll(1.0)
-                    if msg is None:
-                        await asyncio.sleep(0.1)  # Small delay to prevent CPU spinning
-                        continue
-                    
-                    if msg.error():
-                        # Replace the incorrect KafkaException._PARTITION_EOF with the correct error code
-                        if msg.error().code() == KafkaError._PARTITION_EOF:
-                            logger.info(f"Reached end of partition {msg.partition()}")
-                        else:
-                            logger.error(f"Error: {msg.error()}")
-                        continue
-                    
-                    # Process message
-                    try:
-                        value = self._parse_message(msg.value())
-                        logger.info(f"Received FAQ message from partition {msg.partition()}, offset {msg.offset()}")
-                        await self.process_faq_message(value)
-                        
-                    except Exception as e:
-                        logger.error(f"Error processing message: {str(e)}", exc_info=True)
-                        await self.send_to_dead_letter_queue(
-                            self.faq_dlq_topic,
-                            self._parse_message(msg.value()) if msg.value() else {},
-                            str(e)
-                        )
-            finally:
-                consumer.close()
-                logger.info("FAQ Kafka consumer closed") 
-
-        # Start consuming messages concurrently with a single exception handler
         try:
+            # Test Elasticsearch connectivity
+            if not await self._test_elasticsearch_connection():
+                startup_success = False
+                logger.error("✗ STARTUP FAILED: Elasticsearch connectivity check failed")
+            
+            # Initialize Kafka producer
+            logger.info("Initializing Kafka producer...")
+            try:
+                self.producer = Producer(self.producer_config)
+                logger.info("✓ Kafka producer initialized successfully")
+                
+                # Test Kafka connectivity
+                if not await self._test_kafka_connectivity():
+                    startup_success = False
+                    logger.error("✗ STARTUP FAILED: Kafka connectivity check failed")
+                    
+            except Exception as e:
+                startup_success = False
+                logger.error(f"✗ STARTUP FAILED: Kafka producer initialization failed: {e}")
+            
+            # Setup Elasticsearch indices
+            try:
+                await self._setup_elasticsearch_indices()
+            except Exception as e:
+                startup_success = False
+                logger.error(f"✗ STARTUP FAILED: Elasticsearch setup failed: {e}")
+            
+            if not startup_success:
+                logger.error("=" * 60)
+                logger.error("SYSTEM STARTUP FAILED - CRITICAL ERRORS DETECTED")
+                logger.error("Please check the logs above and fix connectivity issues")
+                logger.error("=" * 60)
+                raise Exception("System startup failed due to connectivity issues")
+            
+            # Log successful startup
+            logger.info("=" * 60)
+            logger.info("🎉 SYSTEM STARTUP SUCCESSFUL! 🎉")
+            logger.info("✓ All connectivity checks passed")
+            logger.info("✓ Elasticsearch: Connected and healthy")
+            logger.info("✓ Kafka: Producer and topics verified")
+            logger.info("✓ SentenceTransformer: Model loaded")
+            logger.info("✓ Language Detection: Ready")
+            logger.info("=" * 60)
+            logger.info("System is now ready to process messages...")
+            
+            # Create separate methods for the consumer loops
+            async def document_consumer_loop():
+                logger.info(f"Starting document consumer for topic: {self.document_request_topic}")
+                consumer = Consumer(self.consumer_config)
+                
+                try:
+                    consumer.subscribe([self.document_request_topic])
+                    logger.info(f"✓ Document consumer subscribed to topic: {self.document_request_topic}")
+                    
+                    while not self.shutdown_requested:
+                        msg = consumer.poll(1.0)
+                        if msg is None:
+                            await asyncio.sleep(0.1)
+                            continue
+                        
+                        if msg.error():
+                            if msg.error().code() == KafkaError._PARTITION_EOF:
+                                logger.debug(f"Reached end of partition {msg.partition()}")
+                            else:
+                                logger.error(f"Document consumer error: {msg.error()}")
+                            continue
+                        
+                        # Process message
+                        try:
+                            value = self._parse_message(msg.value())
+                            logger.info(f"📄 Processing document message (partition: {msg.partition()}, offset: {msg.offset()})")
+                            await self.process_document_message(value)
+                            logger.info("✓ Document message processed successfully")
+                            
+                        except Exception as e:
+                            logger.error(f"✗ Error processing document message: {str(e)}", exc_info=True)
+                            await self.send_to_dead_letter_queue(
+                                self.document_dlq_topic,
+                                self._parse_message(msg.value()) if msg.value() else {},
+                                str(e)
+                            )
+                            
+                except Exception as e:
+                    logger.error(f"✗ CRITICAL: Document consumer error: {e}", exc_info=True)
+                    raise
+                finally:
+                    consumer.close()
+                    logger.info("📄 Document Kafka consumer closed")
+
+            async def faq_consumer_loop():
+                logger.info(f"Starting FAQ consumer for topic: {self.faq_request_topic}")
+                consumer = Consumer(self.consumer_config)
+                
+                try:
+                    consumer.subscribe([self.faq_request_topic])
+                    logger.info(f"✓ FAQ consumer subscribed to topic: {self.faq_request_topic}")
+                    
+                    while not self.shutdown_requested:
+                        msg = consumer.poll(1.0)
+                        if msg is None:
+                            await asyncio.sleep(0.1)
+                            continue
+                        
+                        if msg.error():
+                            if msg.error().code() == KafkaError._PARTITION_EOF:
+                                logger.debug(f"Reached end of partition {msg.partition()}")
+                            else:
+                                logger.error(f"FAQ consumer error: {msg.error()}")
+                            continue
+                        
+                        # Process message
+                        try:
+                            value = self._parse_message(msg.value())
+                            logger.info(f"❓ Processing FAQ message (partition: {msg.partition()}, offset: {msg.offset()})")
+                            await self.process_faq_message(value)
+                            logger.info("✓ FAQ message processed successfully")
+                            
+                        except Exception as e:
+                            logger.error(f"✗ Error processing FAQ message: {str(e)}", exc_info=True)
+                            await self.send_to_dead_letter_queue(
+                                self.faq_dlq_topic,
+                                self._parse_message(msg.value()) if msg.value() else {},
+                                str(e)
+                            )
+                            
+                except Exception as e:
+                    logger.error(f"✗ CRITICAL: FAQ consumer error: {e}", exc_info=True)
+                    raise
+                finally:
+                    consumer.close()
+                    logger.info("❓ FAQ Kafka consumer closed")
+
+            # Start consuming messages concurrently
             await asyncio.gather(
                 document_consumer_loop(),
                 faq_consumer_loop()
             )
+            
         except KeyboardInterrupt:
-            logger.info("Keyboard interrupt received, shutting down...")
+            logger.info("⚠ Keyboard interrupt received, shutting down gracefully...")
         except Exception as e:
-            logger.error(f"Fatal error in main loop: {str(e)}", exc_info=True)
+            logger.error(f"✗ CRITICAL: Fatal error in main loop: {str(e)}", exc_info=True)
+            logger.error("=" * 60)
+            logger.error("SYSTEM ENCOUNTERED A FATAL ERROR")
+            logger.error("=" * 60)
+            raise
         finally:
             await self.shutdown()
 
     async def shutdown(self):
         """Graceful shutdown of resources."""
-        logger.info("Shutting down...")
+        logger.info("=" * 40)
+        logger.info("INITIATING GRACEFUL SHUTDOWN")
+        logger.info("=" * 40)
         
-        # Close the Elasticsearch client
-        await self.es_client.close()
-        
-        # Ensure all messages are delivered before shutting down producer
-        if self.producer:
-            self.producer.flush()
-        
-        logger.info("Resources closed.")
+        try:
+            # Close the Elasticsearch client
+            logger.info("Closing Elasticsearch connection...")
+            await self.es_client.close()
+            logger.info("✓ Elasticsearch connection closed")
+            
+            # Ensure all messages are delivered before shutting down producer
+            if self.producer:
+                logger.info("Flushing Kafka producer...")
+                self.producer.flush()
+                logger.info("✓ Kafka producer flushed")
+            
+            logger.info("=" * 40)
+            logger.info("✓ GRACEFUL SHUTDOWN COMPLETED")
+            logger.info("=" * 40)
+            
+        except Exception as e:
+            logger.error(f"✗ Error during shutdown: {e}")
 
 
-# Example usage
 if __name__ == "__main__":
     # Initialize processor
-    processor = MultilingualMessageProcessor(ES_CONFIG, KAFKA_CONFIG)
-    
-    # Run the processor
-    asyncio.run(processor.run())
+    try:
+        logger.info("🚀 Starting Multilingual Message Processor Application")
+        processor = MultilingualMessageProcessor(ES_CONFIG, KAFKA_CONFIG)
+        
+        # Run the processor
+        asyncio.run(processor.run())
+        
+    except KeyboardInterrupt:
+        logger.info("👋 Application stopped by user")
+    except Exception as e:
+        logger.error(f"💥 Application failed to start: {e}", exc_info=True)
+        sys.exit(1)
