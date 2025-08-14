@@ -16,6 +16,10 @@ from confluent_kafka import Consumer, Producer, KafkaError
 from pydantic import BaseModel
 from config import KAFKA_CONFIG,ES_CONFIG
 from libaryLanguage import LibraryLanguageDetector
+from contextvars import ContextVar
+
+
+tracking_id_var = ContextVar("tracking_id", default="NA")
 
 
 class DataStorageDto(BaseModel):
@@ -1514,11 +1518,15 @@ class MultilingualMessageProcessor:
             else:
                 future.set_result(msg)
         
+        # Get current trackingId
+        tracking_id = tracking_id_var.get() or "NA"
+
         self.producer.produce(
             topic,
             key=serialized_key,
             value=serialized_value,
-            callback=delivery_callback
+            callback=delivery_callback,
+            headers=[("trackingId", tracking_id.encode("utf-8"))]
         )
         self.producer.poll(1)  # Trigger delivery callbacks
         self.producer.flush()
@@ -1716,6 +1724,11 @@ class MultilingualMessageProcessor:
                                 logger.error(f"Document consumer error: {msg.error()}")
                             continue
                         
+                        # --- Set the tracking ID from Kafka headers before logging ---
+                        kafka_headers = dict(msg.headers() or [])
+                        tracking_id = kafka_headers.get('trackingId', 'NA')
+                        tracking_id_var.set(tracking_id)
+
                         # Process message
                         try:
                             value = self._parse_message(msg.value())
