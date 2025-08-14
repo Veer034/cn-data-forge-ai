@@ -260,6 +260,22 @@ deactivate your virtual environment if it's active:
 
     tail -n 50 ~/cn-data-forge-ai/logs/server.log
 
+### Check logs for that service
+
+    journalctl -u cn-data-forge-ai.service
+
+### Rotate the journal for that service (so old logs can be vacuumed)
+
+    sudo journalctl --unit=cn-data-forge-ai.service --rotate
+
+### Delete old logs for that service
+
+    sudo journalctl --unit=cn-data-forge-ai.service --vacuum-time=1s
+
+
+    # Or to keep only the last 7 days:
+    sudo journalctl --unit=cn-data-forge-ai.service --vacuum-time=7d
+
 ### List all topics
 
 kafka-topics.sh --list --bootstrap-server 57.159.53.43:9092
