@@ -212,6 +212,7 @@ deactivate your virtual environment if it's active:
     ExecStart=/home/azureuser/cn-data-forge-ai/myvenv/bin/python master.py
     Restart=always
     RestartSec=10
+    StartLimitIntervalSec=0
     StandardOutput=journal
     StandardError=journal
 
