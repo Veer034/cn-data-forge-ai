@@ -1121,17 +1121,18 @@ class MultilingualMessageProcessor:
             
         return chunks
 
-    def chunk_text(self, text: str, language: str, max_chunk_size: int = 300) -> List[str]:
+    def chunk_text(self, text: str, language: str, max_chunk_size: int = 300, overlap_percentage: float = 0.15) -> List[str]:
         """
-        Split text into appropriate sized chunks with language awareness.
+        Split text into appropriate sized chunks with language awareness and overlap for context preservation.
         
         Args:
             text: Text to chunk
             language: Language code
             max_chunk_size: Maximum words per chunk
+            overlap_percentage: Percentage of chunk to overlap with next chunk (0.1 to 0.2 recommended)
             
         Returns:
-            List of text chunks
+            List of text chunks with overlap
         """
         # Split text into paragraphs
         paragraphs = re.split(r'\n\s*\n', text)
@@ -1223,8 +1224,74 @@ class MultilingualMessageProcessor:
         if current_chunk:
             chunks.append("\n\n".join(current_chunk))
         
+        # Apply overlap to chunks for context preservation
+        if len(chunks) > 1 and overlap_percentage > 0:
+            chunks = self._apply_chunk_overlap(chunks, overlap_percentage, count_chars)
+        
         # Ensure we don't have empty chunks
         return [chunk for chunk in chunks if chunk.strip()]
+
+    def _apply_chunk_overlap(self, chunks: List[str], overlap_percentage: float, count_chars: bool) -> List[str]:
+        """Apply overlap between consecutive chunks to preserve context"""
+        if len(chunks) <= 1:
+            return chunks
+        
+        overlapped_chunks = []
+        
+        for i, chunk in enumerate(chunks):
+            current_chunk = chunk
+            
+            # Add overlap from previous chunk (except for first chunk)
+            if i > 0:
+                prev_chunk = chunks[i - 1]
+                overlap_size = int(len(prev_chunk) * overlap_percentage) if count_chars else int(len(prev_chunk.split()) * overlap_percentage)
+                
+                if count_chars:
+                    # For character-based languages, take last N characters
+                    prev_overlap = prev_chunk[-overlap_size:] if overlap_size > 0 else ""
+                else:
+                    # For word-based languages, take last N words
+                    prev_words = prev_chunk.split()
+                    prev_overlap = " ".join(prev_words[-overlap_size:]) if overlap_size > 0 else ""
+                
+                if prev_overlap.strip():
+                    current_chunk = prev_overlap + " " + current_chunk
+            
+            overlapped_chunks.append(current_chunk)
+        
+        return overlapped_chunks
+    
+    def _extract_keywords(self, text: str, language: str, max_keywords: int = 5) -> List[str]:
+        """Extract key terms from chunk text for better matching"""
+        import re
+        from collections import Counter
+        
+        # Simple keyword extraction based on frequency and length
+        # Remove common stop words and extract meaningful terms
+        
+        # Basic cleanup
+        cleaned_text = re.sub(r'[^\w\s]', ' ', text.lower())
+        words = cleaned_text.split()
+        
+        # Filter words (length > 3, not purely numeric)
+        meaningful_words = [
+            word for word in words 
+            if len(word) > 3 and not word.isdigit() and word.isalpha()
+        ]
+        
+        # Count frequency and take top terms
+        word_freq = Counter(meaningful_words)
+        keywords = [word for word, freq in word_freq.most_common(max_keywords)]
+        
+        return keywords
+
+    def _create_context_summary(self, chunk_text: str, section: str, language: str) -> str:
+        """Create a brief context summary for the chunk"""
+        # Simple context summary - can be enhanced with LLM if needed
+        first_sentence = chunk_text.split('.')[0][:100] + "..." if len(chunk_text) > 100 else chunk_text
+        return f"From {section}: {first_sentence}"
+
+
 
     async def _setup_elasticsearch_indices(self):
         """Setup Elasticsearch indices with proper mappings for vector search"""
@@ -1248,7 +1315,12 @@ class MultilingualMessageProcessor:
                         "documentId": {"type": "keyword"},
                         "chunkType": {"type": "keyword"},
                         "sectionTitle": {"type": "text"},
-                        "metadata": {"type": "object", "enabled": True}
+                        "metadata": {"type": "object", "enabled": True},
+                        "chunkPosition": {"type": "integer"},
+                        "totalChunks": {"type": "integer"},
+                        "hasOverlap": {"type": "boolean"},
+                        "keywords": {"type": "keyword"},
+                        "contextSummary": {"type": "text"}
                     }
                 }
             )
@@ -1257,6 +1329,7 @@ class MultilingualMessageProcessor:
     async def process_document_message(self, message: Dict[str, Any]):
         """
         Process an individual message and store it in Elasticsearch with vector embeddings.
+        Enhanced with context preservation features.
         
         Args:
             message: Message dictionary containing content and metadata.
@@ -1276,7 +1349,7 @@ class MultilingualMessageProcessor:
         if not language:
             language = self.detect_best_language(content)
             metadata['language'] = language
-     
+    
         # Extract semantic chunks with language awareness
         chunks = self.extract_chunks(content, language)
         logger.info(f"Extracted {len(chunks)} semantic chunks from document")
@@ -1287,13 +1360,21 @@ class MultilingualMessageProcessor:
             # Generate vector embedding for the chunk
             vector = self.st_model.encode(chunk.text).tolist()
             
+            # Extract keywords for better matching
+            keywords = self._extract_keywords(chunk.text, language)
+            
+            # Create context summary
+            context_summary = self._create_context_summary(chunk.text, chunk.section, language)
+            
             # Add any additional metadata from the message
             combined_metadata = {**metadata}
             combined_metadata.update(chunk.metadata.model_dump())
             combined_metadata['chunkIndex'] = i
             combined_metadata['totalChunks'] = len(chunks)
+            combined_metadata['keywords'] = keywords
+            combined_metadata['hasOverlap'] = i > 0  # All chunks except first have overlap
             
-            # Prepare chunk document
+            # Prepare chunk document with enhanced fields
             chunk_doc = {
                 'content': chunk.text,
                 'contentVector': vector,
@@ -1301,7 +1382,13 @@ class MultilingualMessageProcessor:
                 'documentId': document_id,
                 'chunkType': chunk.type,
                 'sectionTitle': chunk.section,
-                'metadata': combined_metadata
+                'metadata': combined_metadata,
+                # New context preservation fields
+                'chunkPosition': i,
+                'totalChunks': len(chunks),
+                'hasOverlap': i > 0,
+                'keywords': keywords,
+                'contextSummary': context_summary
             }
             
             # Index the chunk
@@ -1329,13 +1416,12 @@ class MultilingualMessageProcessor:
             }
         }
         
-        # Delete from both indices
+        # Delete from index
         await self.es_client.delete_by_query(
             index=self.es_config['tenant_document_index_name'], 
             body=delete_query
         )
 
-        
         logger.info(f"Deleted old inactive documents for tenant_id: {tenant_id}")
         
         # Send success response
