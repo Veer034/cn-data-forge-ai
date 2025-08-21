@@ -772,119 +772,1410 @@ class MultilingualMessageProcessor:
             
             return [s.strip() for s in sentences if s.strip()]
 
-    def identify_document_sections(self, text: str, language: str) -> List[Tuple[str, str]]:
+    def identify_document_sections(self, text: str, language: str, 
+                               overlap_sentences: int = 2, 
+                               min_section_length: int = 100,
+                               max_section_length: int = 2000,
+                               min_divider_length: int = 5) -> List[Tuple[str, str]]:
         """
-        Identify document sections with language-specific patterns.
+        Identify document sections with manual dividers as priority, then language-specific patterns and overlapping content.
         
         Args:
             text: Document text
             language: Language code
+            overlap_sentences: Number of sentences to overlap between sections
+            min_section_length: Minimum character length for a section
+            max_section_length: Maximum character length before splitting
+            min_divider_length: Minimum length for manual dividers (default: 5)
             
         Returns:
-            List of (section_title, section_content) tuples
+            List of (section_title, section_content) tuples with overlapping content
         """
+        if not text.strip():
+            return [("General", text)]
+        
         script_group = self.get_script_group(language)
+        
+        # PRIORITY 1: Check for manual dividers first
+        manual_sections = self._identify_manual_dividers(text, min_divider_length)
+        if manual_sections:
+            print(f"Found {len(manual_sections)} sections using manual dividers")
+            
+            # Check if any manual sections are too large and need further subdivision
+            final_manual_sections = []
+            for title, content in manual_sections:
+                if len(content) > max_section_length:
+                    print(f"Section '{title}' is too large ({len(content)} chars), subdividing...")
+                    # Subdivide large manual sections
+                    sub_sections = self._subdivide_large_section(title, content, language, script_group, 
+                                                            max_section_length, min_section_length)
+                    final_manual_sections.extend(sub_sections)
+                else:
+                    final_manual_sections.append((title, content))
+            
+            # Add overlapping content between manually divided sections
+            overlapped_sections = self._add_section_overlaps(final_manual_sections, text, language, overlap_sentences)
+            return self._ensure_complete_coverage(overlapped_sections, text, language)
+        
+        # PRIORITY 2: Try to identify natural sections using existing logic
+        sections = self._identify_natural_sections(text, language, script_group)
+        
+        # PRIORITY 3: If no natural sections found or sections are too long, create artificial sections
+        if not sections or any(len(content) > max_section_length for _, content in sections):
+            sections = self._create_chunked_sections(text, language, script_group, 
+                                                max_section_length, min_section_length)
+        
+        # Add overlapping content between sections
+        overlapped_sections = self._add_section_overlaps(sections, text, language, 
+                                                    overlap_sentences)
+        
+        # Ensure complete text coverage
+        final_sections = self._ensure_complete_coverage(overlapped_sections, text, language)
+        
+        return final_sections
+
+    def _identify_manual_dividers(self, text: str, min_divider_length: int = 5) -> List[Tuple[str, str]]:
+        """
+        Identify sections separated by manual dividers like ======= (5+ characters).
+        
+        Args:
+            text: Document text
+            min_divider_length: Minimum length for dividers
+            
+        Returns:
+            List of (section_title, section_content) tuples or empty list if no dividers found
+        """
+        # Define various divider patterns that users might use
+        divider_patterns = [
+            rf'(?:^|\n)\s*([=]{{{min_divider_length},}})\s*(?:\n|$)',  # ======= (primary)
+            rf'(?:^|\n)\s*([-]{{{min_divider_length},}})\s*(?:\n|$)',  # ------- 
+            rf'(?:^|\n)\s*([*]{{{min_divider_length},}})\s*(?:\n|$)',  # *******
+            rf'(?:^|\n)\s*([#]{{{min_divider_length},}})\s*(?:\n|$)',  # #######
+            rf'(?:^|\n)\s*([~]{{{min_divider_length},}})\s*(?:\n|$)',  # ~~~~~~~
+            rf'(?:^|\n)\s*([_]{{{min_divider_length},}})\s*(?:\n|$)',  # _______
+            rf'(?:^|\n)\s*([+]{{{min_divider_length},}})\s*(?:\n|$)',  # +++++++
+        ]
+        
+        for pattern in divider_patterns:
+            divider_matches = list(re.finditer(pattern, text, re.MULTILINE))
+            
+            if len(divider_matches) >= 1:  # At least one divider found
+                print(f"Found {len(divider_matches)} manual dividers with pattern: {pattern}")
+                
+                sections = []
+                start_pos = 0
+                section_num = 1
+                
+                for i, match in enumerate(divider_matches):
+                    divider_start = match.start()
+                    divider_end = match.end()
+                    
+                    # Extract content before this divider
+                    if divider_start > start_pos:
+                        content_before = text[start_pos:divider_start].strip()
+                        if content_before and len(content_before) >= 10:  # Minimum content check
+                            title = self._extract_section_title_from_content(content_before, section_num)
+                            sections.append((title, content_before))
+                            section_num += 1
+                    
+                    # Update start position for next section
+                    start_pos = divider_end
+                
+                # Handle content after the last divider
+                if start_pos < len(text):
+                    remaining_content = text[start_pos:].strip()
+                    if remaining_content and len(remaining_content) >= 10:
+                        title = self._extract_section_title_from_content(remaining_content, section_num)
+                        sections.append((title, remaining_content))
+                
+                # If we found meaningful sections, return them
+                if sections and len(sections) > 1:
+                    return sections
+                elif sections and len(sections) == 1:
+                    # Single section with dividers - might be title/content separation
+                    return sections
+        
+        # Also check for combination dividers (text between dividers)
+        combined_pattern = rf'(?:^|\n)\s*[=\-*#~_+]{{{min_divider_length},}}\s*(?:\n|$)'
+        all_dividers = list(re.finditer(combined_pattern, text, re.MULTILINE))
+        
+        if len(all_dividers) >= 1:
+            sections = []
+            
+            # Content before first divider
+            if all_dividers[0].start() > 0:
+                content = text[:all_dividers[0].start()].strip()
+                if content and len(content) >= 10:
+                    title = self._extract_section_title_from_content(content, 1)
+                    sections.append((title, content))
+            
+            # Content between dividers
+            for i in range(len(all_dividers)):
+                start_pos = all_dividers[i].end()
+                end_pos = all_dividers[i + 1].start() if i + 1 < len(all_dividers) else len(text)
+                
+                content = text[start_pos:end_pos].strip()
+                if content and len(content) >= 10:
+                    title = self._extract_section_title_from_content(content, len(sections) + 1)
+                    sections.append((title, content))
+            
+            if len(sections) > 0:
+                return sections
+        
+        return []  # No manual dividers found
+
+    def _extract_section_title_from_content(self, content: str, section_num: int) -> str:
+        """
+        Extract a meaningful title from section content.
+        
+        Args:
+            content: Section content
+            section_num: Section number for fallback
+            
+        Returns:
+            Section title
+        """
+        lines = content.split('\n')
+        
+        # Try first non-empty line as title
+        for line in lines[:3]:  # Check first 3 lines
+            line = line.strip()
+            if line and len(line) > 0:
+                # Check if this line looks like a title
+                if self._looks_like_title(line):
+                    return line[:100]  # Limit title length
+        
+        # Try to find a line that's shorter and might be a header
+        for line in lines[:5]:
+            line = line.strip()
+            if line and 5 < len(line) < 80 and not line.endswith(('.', '。', '।', '؟', '?', '!')):
+                return line
+        
+        # Extract key words from first sentence for auto-title
+        first_sentence = self._get_first_sentence(content)
+        if first_sentence and 10 < len(first_sentence) < 100:
+            return first_sentence
+        
+        # Fallback to generic title
+        return f"Section {section_num}"
+
+    def _looks_like_title(self, line: str) -> bool:
+        """
+        Determine if a line looks like a title/header.
+        
+        Args:
+            line: Text line to check
+            
+        Returns:
+            True if line looks like a title
+        """
+        line = line.strip()
+        
+        # Empty or too long
+        if not line or len(line) > 120:
+            return False
+        
+        # All caps might be a title
+        if line.isupper() and len(line) > 3:
+            return True
+        
+        # Starts with capital and doesn't end with sentence ending
+        if (line[0].isupper() and 
+            not line.endswith(('.', '。', '।', '؟', '?', '!', ',', ';', ':')) and
+            5 < len(line) < 80):
+            return True
+        
+        # Contains title-like patterns
+        title_patterns = [
+            r'^(Chapter|Section|Part|Unit|Module|Lesson|Topic)\s+\d+',
+            r'^\d+[\.\)]\s+[A-Z]',
+            r'^[A-Z][^.!?]*[A-Z][^.!?]*$',  # Multiple capitals, no sentence endings
+            r'^\s*[IVX]+\.\s+[A-Z]',  # Roman numerals
+        ]
+        
+        for pattern in title_patterns:
+            if re.match(pattern, line, re.IGNORECASE):
+                return True
+        
+        return False
+
+    def _get_first_sentence(self, text: str) -> str:
+        """Extract the first sentence from text."""
+        # Find first sentence ending
+        sentence_endings = '.!?。।؟'
+        
+        for i, char in enumerate(text):
+            if char in sentence_endings:
+                # Make sure it's not an abbreviation
+                if i + 1 < len(text) and text[i + 1] in ' \n\t':
+                    return text[:i + 1].strip()
+        
+        # If no sentence ending found, return first 100 characters
+        return text[:100].strip() + '...' if len(text) > 100 else text.strip()
+
+    def _identify_natural_sections(self, text: str, language: str, script_group: str) -> List[Tuple[str, str]]:
+        """Identify natural document sections using various patterns."""
         
         # Try Markdown-style headers first (universal format)
         markdown_patterns = [
-            # Level 2 headers with content
-            (r'(?:^|\n)##\s+(.*?)(?:\n|$)((?:.|\n)*?)(?=\n##|\Z)', True),
-            # Level 1 headers with content
-            (r'(?:^|\n)#\s+(.*?)(?:\n|$)((?:.|\n)*?)(?=\n#|\Z)', True)
+            # Level 1-4 headers with content
+            (r'(?:^|\n)(#{1,4})\s+(.*?)(?:\n|$)((?:.|\n)*?)(?=\n#{1,4}|\Z)', 'markdown'),
+            # Alternative markdown with underlines
+            (r'(?:^|\n)(.+?)\n([=\-]{3,})\n((?:.|\n)*?)(?=\n.+?\n[=\-]{3,}|\Z)', 'underline')
         ]
         
-        for pattern, is_full_match in markdown_patterns:
+        for pattern, pattern_type in markdown_patterns:
             matches = re.finditer(pattern, text, re.MULTILINE | re.DOTALL)
-            sections = [(m.group(1).strip(), m.group(2).strip()) for m in matches]
+            sections = []
+            for m in matches:
+                if pattern_type == 'markdown':
+                    title = m.group(2).strip()
+                    content = m.group(3).strip()
+                else:  # underline
+                    title = m.group(1).strip()
+                    content = m.group(3).strip()
+                
+                if content:  # Only add sections with actual content
+                    sections.append((title, content))
+            
             if sections:
                 return sections
         
         # Try language-specific section headers
         section_terms = self.get_section_headers(language)
+        sections = self._find_sections_by_headers(text, section_terms, script_group)
         
-        # Create patterns for each section term
+        if sections:
+            return sections
+        
+        # Try numbered sections
+        numbered_sections = self._find_numbered_sections(text, script_group)
+        if numbered_sections:
+            return numbered_sections
+        
+        # Try other visual separators (but not the manual dividers we already checked)
+        separator_sections = self._find_other_separator_sections(text)
+        if separator_sections:
+            return separator_sections
+        
+        return []
+
+    def _find_sections_by_headers(self, text: str, section_terms: List[str], 
+                                script_group: str) -> List[Tuple[str, str]]:
+        """Find sections using language-specific headers."""
+        if not section_terms:
+            return []
+        
         section_patterns = []
         for term in section_terms:
             if script_group in ['latin', 'cyrillic', 'greek']:
-                # For Latin/Cyrillic/Greek scripts, look for capitalized headers
-                pattern = rf'(?:^|\n)(?:{term}|{term.capitalize()})\s*\d*[\.\:]\s*(.*?)(?:\n|$)'
-                section_patterns.append(pattern)
+                # Case-insensitive matching for Latin-based scripts
+                pattern = rf'(?:^|\n)(?:{re.escape(term)}|{re.escape(term.capitalize())}|{re.escape(term.upper())})\s*\d*[\.\:：]\s*([^\n]*?)(?:\n|$)'
             else:
-                # For other scripts, just look for the term
-                pattern = rf'(?:^|\n){term}\s*\d*[\.\:]\s*(.*?)(?:\n|$)'
-                section_patterns.append(pattern)
+                # For other scripts
+                pattern = rf'(?:^|\n){re.escape(term)}\s*\d*[\.\:：。]\s*([^\n]*?)(?:\n|$)'
+            section_patterns.append((pattern, term))
         
-        # Also include numbered headers
+        all_headers = []
+        for pattern, term in section_patterns:
+            for match in re.finditer(pattern, text, re.MULTILINE | re.IGNORECASE):
+                start_pos = match.start()
+                header_text = match.group(1).strip() if match.group(1).strip() else term
+                all_headers.append((start_pos, header_text, match.end()))
+        
+        if not all_headers:
+            return []
+        
+        # Sort headers by position
+        all_headers.sort(key=lambda x: x[0])
+        
+        sections = []
+        for i, (start_pos, header, header_end) in enumerate(all_headers):
+            # Find content until next header or end of text
+            next_pos = all_headers[i + 1][0] if i + 1 < len(all_headers) else len(text)
+            content = text[header_end:next_pos].strip()
+            
+            if content:
+                sections.append((header, content))
+        
+        return sections
+
+    def _find_numbered_sections(self, text: str, script_group: str) -> List[Tuple[str, str]]:
+        """Find numbered sections based on script group."""
         if script_group == 'cjk':
-            # CJK numbering
-            numbered_header = r'(?:^|\n)(?:[一二三四五六七八九十]+[\.．、]|[0-9]+[\.．、])\s*([^\n]+)'
+            # CJK numbering patterns
+            patterns = [
+                r'(?:^|\n)([一二三四五六七八九十百千]+[\.．、])\s*([^\n]*?)(?:\n|$)',
+                r'(?:^|\n)([0-9]+[\.．、])\s*([^\n]*?)(?:\n|$)',
+                r'(?:^|\n)([第][一二三四五六七八九十百千]+[章节部分])\s*([^\n]*?)(?:\n|$)'
+            ]
         elif script_group in ['devanagari', 'bengali', 'dravidian', 'gurmukhi', 'gujarati']:
-            # Indic numbering or Latin numbers
-            numbered_header = r'(?:^|\n)(?:\d+[\.।]|[१२३४५६७८९०]+[\.।])\s*([^\n]+)'
+            # Indic script numbering
+            patterns = [
+                r'(?:^|\n)([०१२३४५६७८९]+[\.।])\s*([^\n]*?)(?:\n|$)',
+                r'(?:^|\n)(\d+[\.।])\s*([^\n]*?)(?:\n|$)'
+            ]
         elif script_group == 'arabic':
-            # Arabic/Persian numbering
-            numbered_header = r'(?:^|\n)(?:\d+[\.،]|[١٢٣٤٥٦٧٨٩٠]+[\.،])\s*([^\n]+)'
+            # Arabic script numbering
+            patterns = [
+                r'(?:^|\n)([١٢٣٤٥٦٧٨٩٠]+[\.،])\s*([^\n]*?)(?:\n|$)',
+                r'(?:^|\n)(\d+[\.،])\s*([^\n]*?)(?:\n|$)'
+            ]
+        elif script_group == 'thai':
+            # Thai numbering
+            patterns = [
+                r'(?:^|\n)([๐๑๒๓๔๕๖๗๘๙]+[\.])\s*([^\n]*?)(?:\n|$)',
+                r'(?:^|\n)(\d+[\.])?\s*([^\n]*?)(?:\n|$)'
+            ]
         else:
             # Default Latin numbering
-            numbered_header = r'(?:^|\n)\d+[\.]\s*([^\n]+)'
-            
-        section_patterns.append(numbered_header)
+            patterns = [
+                r'(?:^|\n)(\d+[\.]\s*[^\n]*?)(?:\n|$)',
+                r'(?:^|\n)([a-zA-Z]\.\s*[^\n]*?)(?:\n|$)',
+                r'(?:^|\n)([IVX]+\.\s*[^\n]*?)(?:\n|$)'
+            ]
         
-        # Try to find sections using the patterns
-        for pattern in section_patterns:
-            headers = re.finditer(pattern, text)
-            header_positions = [(m.start(), m.group(1).strip()) for m in headers]
-            
-            if len(header_positions) > 0:
+        for pattern in patterns:
+            headers = list(re.finditer(pattern, text, re.MULTILINE))
+            if len(headers) >= 2:  # Need at least 2 sections
                 sections = []
-                for i in range(len(header_positions)):
-                    start_pos, header = header_positions[i]
-                    end_pos = header_positions[i+1][0] if i+1 < len(header_positions) else len(text)
+                for i, match in enumerate(headers):
+                    start_pos = match.start()
+                    if len(match.groups()) >= 2:
+                        number = match.group(1).strip()
+                        title = match.group(2).strip() if match.group(2) else f"Section {number}"
+                    else:
+                        title = match.group(1).strip()
                     
-                    # Extract the section content, excluding the header itself
-                    header_line_end = text.find('\n', start_pos + 1)
-                    if header_line_end == -1:
-                        header_line_end = len(text)
+                    # Find content
+                    content_start = match.end()
+                    content_end = headers[i + 1].start() if i + 1 < len(headers) else len(text)
+                    content = text[content_start:content_end].strip()
                     
-                    content = text[header_line_end:end_pos].strip()
-                    sections.append((header, content))
-                    
+                    if content:
+                        sections.append((title, content))
+                
                 if sections:
                     return sections
         
-        # If no sections found, look for visual separators
+        return []
+
+    def _find_other_separator_sections(self, text: str) -> List[Tuple[str, str]]:
+        """Find sections separated by other visual separators (excluding manual dividers)."""
         separator_patterns = [
-            r'\n-{3,}\n',  # Markdown-style separators
-            r'\n\*{3,}\n',  # Asterisk separators
-            r'\n={3,}\n',   # Equals separators
-            r'\n\n\n+'      # Multiple blank lines
+            r'\n\s*[•·]{3,}\s*\n',    # Bullet separators
+            r'\n\s*\n\s*\n',          # Multiple blank lines
+            r'\n\s*[~]{3,4}\s*\n'     # Short tilde separators (not manual dividers)
         ]
         
         for pattern in separator_patterns:
             parts = re.split(pattern, text)
             if len(parts) > 1:
                 sections = []
-                for part in parts:
+                for i, part in enumerate(parts):
                     part = part.strip()
                     if not part:
                         continue
                     
-                    # Try to use the first line as a header
-                    lines = part.split('\n')
-                    if len(lines) > 1 and len(lines[0].strip()) < 100:  # Reasonable header length
-                        header = lines[0].strip()
-                        content = '\n'.join(lines[1:]).strip()
-                        sections.append((header, content))
+                    # Try to extract title from first line
+                    lines = part.split('\n', 1)
+                    if len(lines) > 1 and len(lines[0].strip()) < 100:
+                        title = lines[0].strip()
+                        content = lines[1].strip()
                     else:
-                        # No clear header, use "Section N"
-                        sections.append((f"Section {len(sections)+1}", part))
-                        
+                        title = f"Section {i + 1}"
+                        content = part
+                    
+                    if content:
+                        sections.append((title, content))
+                
+                if len(sections) > 1:
+                    return sections
+        
+        return []
+
+    def _create_chunked_sections(self, text: str, language: str, script_group: str,
+                            max_section_length: int, min_section_length: int) -> List[Tuple[str, str]]:
+        """Create artificial sections by chunking the text intelligently."""
+        if len(text) <= max_section_length:
+            return [("General", text)]
+        
+        # Get sentence boundaries based on script group
+        sentence_endings = self._get_sentence_endings(script_group)
+        
+        sections = []
+        current_pos = 0
+        section_num = 1
+        
+        while current_pos < len(text):
+            # Find a good breaking point within max_section_length
+            end_pos = min(current_pos + max_section_length, len(text))
+            
+            # First, check if we're in the middle of a list - if so, find the end
+            best_break = self._find_safe_break_point(text, current_pos, end_pos, 
+                                                min_section_length, sentence_endings, script_group)
+            
+            # If we still don't have a good break and we're not at the end, extend to complete the list
+            if best_break == end_pos and end_pos < len(text):
+                list_end = self._find_list_end(text, end_pos, script_group)
+                if list_end > end_pos and list_end - current_pos < max_section_length * 1.5:  # Allow 50% extension for lists
+                    best_break = list_end
+            
+            section_content = text[current_pos:best_break].strip()
+            if section_content:
+                # Generate meaningful title from first line or sentences
+                title = self._extract_section_title_from_content(section_content, section_num)
+                sections.append((title, section_content))
+                section_num += 1
+            
+            current_pos = best_break
+        
+        return sections
+
+    def _get_sentence_endings(self, script_group: str) -> str:
+        """Get sentence ending characters based on script group."""
+        endings = {
+            'latin': '.!?',
+            'cyrillic': '.!?',
+            'arabic': '.!?؟',
+            'cjk': '。！？',
+            'devanagari': '।!?',
+            'bengali': '।!?',
+            'dravidian': '।!?',
+            'thai': '.!?',
+            'greek': '.!?;',
+            'hebrew': '.!?',
+            'gurmukhi': '।!?',
+            'gujarati': '।!?',
+            'sinhala': '.!?',
+            'african': '.!?'
+        }
+        return endings.get(script_group, '.!?')
+
+    def _subdivide_large_section(self, parent_title: str, content: str, language: str, script_group: str,
+                            max_section_length: int, min_section_length: int) -> List[Tuple[str, str]]:
+        """
+        Subdivide a large section (from manual dividers) into smaller manageable sections.
+        
+        Args:
+            parent_title: Title of the parent section
+            content: Content to subdivide
+            language: Language code
+            script_group: Script group for the language
+            max_section_length: Maximum section length
+            min_section_length: Minimum section length
+            
+        Returns:
+            List of (title, content) tuples for subdivided sections
+        """
+        if len(content) <= max_section_length:
+            return [(parent_title, content)]
+        
+        print(f"Subdividing large section: {parent_title}")
+        
+        # Try to find natural sub-sections within this large section first
+        natural_subsections = self._find_natural_subsections_in_content(content, language, script_group)
+        
+        if natural_subsections and len(natural_subsections) > 1:
+            # Check if natural subsections are reasonable sized
+            reasonable_subsections = []
+            for sub_title, sub_content in natural_subsections:
+                if len(sub_content) > max_section_length:
+                    # Even natural subsections are too big, chunk them further
+                    chunked = self._create_chunked_sections_with_prefix(
+                        sub_content, f"{parent_title} - {sub_title}", language, script_group,
+                        max_section_length, min_section_length
+                    )
+                    reasonable_subsections.extend(chunked)
+                else:
+                    # Prefix with parent title to maintain hierarchy
+                    full_title = f"{parent_title} - {sub_title}" if sub_title != parent_title else sub_title
+                    reasonable_subsections.append((full_title, sub_content))
+            
+            if reasonable_subsections:
+                return reasonable_subsections
+        
+        # No natural subsections found or they didn't work out, use intelligent chunking
+        return self._create_chunked_sections_with_prefix(
+            content, parent_title, language, script_group, max_section_length, min_section_length
+        )
+
+    def _find_natural_subsections_in_content(self, content: str, language: str, script_group: str) -> List[Tuple[str, str]]:
+        """
+        Try to find natural subsections within a large content block.
+        
+        Args:
+            content: Content to analyze
+            language: Language code  
+            script_group: Script group
+            
+        Returns:
+            List of natural subsections found
+        """
+        # Try markdown headers (but lower level than main document)
+        markdown_patterns = [
+            # Level 2-6 headers (assuming main doc used level 1)
+            (r'(?:^|\n)(#{2,6})\s+(.*?)(?:\n|$)((?:.|\n)*?)(?=\n#{2,6}|\Z)', 'markdown'),
+            # Bold text headers **Header**
+            (r'(?:^|\n)\*\*(.*?)\*\*\s*(?:\n|$)((?:.|\n)*?)(?=\n\*\*.*?\*\*|\Z)', 'bold'),
+            # Underlined headers
+            (r'(?:^|\n)(.+?)\n([-=]{2,})\n((?:.|\n)*?)(?=\n.+?\n[-=]{2,}|\Z)', 'underline')
+        ]
+        
+        for pattern, pattern_type in markdown_patterns:
+            matches = re.finditer(pattern, content, re.MULTILINE | re.DOTALL)
+            sections = []
+            for m in matches:
+                if pattern_type == 'markdown':
+                    title = m.group(2).strip()
+                    section_content = m.group(3).strip()
+                elif pattern_type == 'bold':
+                    title = m.group(1).strip()
+                    section_content = m.group(2).strip()
+                else:  # underline
+                    title = m.group(1).strip()
+                    section_content = m.group(3).strip()
+                
+                if section_content and len(section_content) > 50:  # Reasonable content
+                    sections.append((title, section_content))
+            
+            if len(sections) > 1:  # Need multiple sections to be useful
+                return sections
+        
+        # Try numbered subsections
+        numbered_patterns = self._get_subsection_number_patterns(script_group)
+        for pattern in numbered_patterns:
+            headers = list(re.finditer(pattern, content, re.MULTILINE))
+            if len(headers) >= 2:
+                sections = []
+                for i, match in enumerate(headers):
+                    title = match.group(1).strip() if match.groups() else f"Subsection {i+1}"
+                    
+                    # Find content
+                    content_start = match.end()
+                    content_end = headers[i + 1].start() if i + 1 < len(headers) else len(content)
+                    section_content = content[content_start:content_end].strip()
+                    
+                    if section_content and len(section_content) > 50:
+                        sections.append((title, section_content))
+                
+                if len(sections) > 1:
+                    return sections
+        
+        # Try paragraph-based separation for very large blocks
+        paragraphs = re.split(r'\n\s*\n', content)
+        if len(paragraphs) > 3:
+            # Group paragraphs into subsections
+            sections = []
+            current_section = []
+            current_length = 0
+            target_length = len(content) // min(6, len(paragraphs))  # Aim for ~6 subsections max
+            
+            for i, paragraph in enumerate(paragraphs):
+                paragraph = paragraph.strip()
+                if not paragraph:
+                    continue
+                    
+                current_section.append(paragraph)
+                current_length += len(paragraph)
+                
+                # Create section if we've hit target length or it's the last paragraph
+                if current_length >= target_length or i == len(paragraphs) - 1:
+                    if current_section:
+                        section_content = '\n\n'.join(current_section)
+                        title = self._extract_section_title_from_content(section_content, len(sections) + 1)
+                        sections.append((title, section_content))
+                        current_section = []
+                        current_length = 0
+            
+            if len(sections) > 1:
+                return sections
+        
+        return []
+
+    def _get_subsection_number_patterns(self, script_group: str) -> List[str]:
+        """Get numbering patterns for subsections based on script group."""
+        if script_group == 'cjk':
+            return [
+                r'(?:^|\n)([a-z]\)|[a-z]\.)\s*([^\n]*?)(?:\n|$)',  # a) or a.
+                r'(?:^|\n)([0-9]+\.[0-9]+)\s*([^\n]*?)(?:\n|$)',   # 1.1, 1.2, etc.
+                r'(?:^|\n)([(][0-9]+[)])\s*([^\n]*?)(?:\n|$)',     # (1), (2), etc.
+            ]
+        elif script_group in ['devanagari', 'bengali', 'dravidian', 'gurmukhi', 'gujarati']:
+            return [
+                r'(?:^|\n)([a-z]\)|[a-z]\.)\s*([^\n]*?)(?:\n|$)',
+                r'(?:^|\n)([0-9]+\.[0-9]+)\s*([^\n]*?)(?:\n|$)',
+                r'(?:^|\n)([(][0-9]+[)])\s*([^\n]*?)(?:\n|$)',
+            ]
+        elif script_group == 'arabic':
+            return [
+                r'(?:^|\n)([a-z]\)|[a-z]\.)\s*([^\n]*?)(?:\n|$)',
+                r'(?:^|\n)([0-9]+\.[0-9]+)\s*([^\n]*?)(?:\n|$)',
+                r'(?:^|\n)([(][0-9]+[)])\s*([^\n]*?)(?:\n|$)',
+            ]
+        else:
+            return [
+                r'(?:^|\n)([a-z]\)|[a-z]\.)\s*([^\n]*?)(?:\n|$)',  # a) or a.
+                r'(?:^|\n)([0-9]+\.[0-9]+)\s*([^\n]*?)(?:\n|$)',   # 1.1, 1.2, etc.
+                r'(?:^|\n)([(][0-9]+[)])\s*([^\n]*?)(?:\n|$)',     # (1), (2), etc.
+                r'(?:^|\n)([i][v]*\.|[i][v]*\))\s*([^\n]*?)(?:\n|$)',  # i., ii., iii., etc.
+            ]
+
+    def _create_chunked_sections_with_prefix(self, text: str, parent_title: str, language: str, script_group: str,
+                                        max_section_length: int, min_section_length: int) -> List[Tuple[str, str]]:
+        """
+        Create chunked sections with parent title prefix for large manual sections.
+        
+        Args:
+            text: Text to chunk
+            parent_title: Parent section title to prefix subsections
+            language: Language code
+            script_group: Script group
+            max_section_length: Maximum section length
+            min_section_length: Minimum section length
+            
+        Returns:
+            List of chunked sections with prefixed titles
+        """
+        if len(text) <= max_section_length:
+            return [(parent_title, text)]
+        
+        # Get sentence boundaries based on script group
+        sentence_endings = self._get_sentence_endings(script_group)
+        
+        sections = []
+        current_pos = 0
+        chunk_num = 1
+        
+        while current_pos < len(text):
+            # Find a good breaking point within max_section_length
+            end_pos = min(current_pos + max_section_length, len(text))
+            
+            # Try to break at sentence boundary
+            best_break = end_pos
+            for i in range(end_pos - 1, max(current_pos + min_section_length, end_pos - 200), -1):
+                if text[i] in sentence_endings and i > current_pos + min_section_length:
+                    best_break = i + 1
+                    break
+            
+            # If no good sentence break found, try paragraph break
+            if best_break == end_pos and end_pos < len(text):
+                for i in range(end_pos - 1, max(current_pos + min_section_length, end_pos - 100), -1):
+                    if text[i:i+2] == '\n\n':
+                        best_break = i + 2
+                        break
+            
+            section_content = text[current_pos:best_break].strip()
+            if section_content:
+                # Create hierarchical title
+                if chunk_num == 1:
+                    # First chunk keeps the original title
+                    title = parent_title
+                else:
+                    # Subsequent chunks get numbered
+                    part_word = self._get_part_word(language)
+                    title = f"{parent_title} - {part_word} {chunk_num}"
+                
+                sections.append((title, section_content))
+                chunk_num += 1
+            
+            current_pos = best_break
+        
+        return sections
+
+    def _find_safe_break_point(self, text: str, current_pos: int, end_pos: int, 
+                            min_section_length: int, sentence_endings: str, script_group: str) -> int:
+        """
+        Find a safe break point that doesn't split ordered lists, bullet points, or numbered items.
+        
+        Args:
+            text: Full text
+            current_pos: Starting position
+            end_pos: Desired ending position
+            min_section_length: Minimum section length
+            sentence_endings: Language-specific sentence endings
+            script_group: Script group for language
+            
+        Returns:
+            Safe break position
+        """
+        # Check if we're in the middle of a list at end_pos
+        if self._is_in_list_context(text, end_pos):
+            # Try to find the end of the current list
+            list_end = self._find_list_end(text, end_pos, script_group)
+            # If list end is reasonable, use it
+            if list_end <= end_pos + 500:  # Don't extend too far
+                return list_end
+        
+        # Try to break at sentence boundary, but avoid breaking lists
+        best_break = end_pos
+        for i in range(end_pos - 1, max(current_pos + min_section_length, end_pos - 200), -1):
+            if text[i] in sentence_endings and i > current_pos + min_section_length:
+                # Check if this sentence ending is safe (not in middle of a list)
+                if not self._is_in_list_context(text, i):
+                    best_break = i + 1
+                    break
+        
+        # If no good sentence break found, try paragraph break
+        if best_break == end_pos and end_pos < len(text):
+            for i in range(end_pos - 1, max(current_pos + min_section_length, end_pos - 100), -1):
+                if text[i:i+2] == '\n\n':
+                    # Double check this isn't breaking a list
+                    if not self._is_in_list_context(text, i):
+                        best_break = i + 2
+                        break
+        
+        return best_break
+
+    def _is_in_list_context(self, text: str, position: int) -> bool:
+        """
+        Check if the given position is within a list context (numbered, bulleted, etc.).
+        
+        Args:
+            text: Full text
+            position: Position to check
+            
+        Returns:
+            True if position is within a list
+        """
+        # Look backward to see if we're in a list
+        lines_to_check = 5  # Check previous 5 lines
+        
+        # Find the line containing this position
+        lines_before = text[:position].split('\n')
+        if not lines_before:
+            return False
+        
+        # Check current line and previous lines for list patterns
+        start_line = max(0, len(lines_before) - lines_to_check)
+        recent_lines = lines_before[start_line:]
+        
+        list_pattern_count = 0
+        
+        for line in recent_lines:
+            line = line.strip()
+            if self._is_list_item(line):
+                list_pattern_count += 1
+        
+        # If we found multiple list items recently, we're likely in a list
+        return list_pattern_count >= 2
+
+    def _is_list_item(self, line: str) -> bool:
+        """
+        Check if a line is a list item (numbered, bulleted, lettered, etc.).
+        
+        Args:
+            line: Text line to check
+            
+        Returns:
+            True if line is a list item
+        """
+        line = line.strip()
+        if not line:
+            return False
+        
+        # Common list patterns across languages
+        list_patterns = [
+            # Numbered lists
+            r'^\d+[\.\)]\s+',           # 1. or 1)
+            r'^\d+\.\d+[\.\)]\s+',      # 1.1. or 1.1)
+            
+            # Lettered lists
+            r'^[a-zA-Z][\.\)]\s+',      # a. or a)
+            r'^[IVX]+[\.\)]\s+',        # I. or I) (Roman numerals)
+            
+            # Bullet points
+            r'^[-\*\+•·◦▪▫]\s+',        # -, *, +, •, ·, ◦, ▪, ▫
+            
+            # Parenthetical numbers/letters
+            r'^\([0-9a-zA-Z]+\)\s+',    # (1) or (a)
+            
+            # Indented items (common in structured docs)
+            r'^\s{2,}[-\*\+•·]\s+',     # Indented bullets
+            r'^\s{2,}\d+[\.\)]\s+',     # Indented numbers
+            
+            # Special characters (other languages)
+            r'^[○●◯◉]\s+',              # Circle bullets
+            r'^[①②③④⑤⑥⑦⑧⑨⑩]\s*',      # Circled numbers
+            r'^[⑴⑵⑶⑷⑸⑹⑺⑻⑼⑽]\s*',      # Parenthesized numbers
+            
+            # Arabic/Persian numbering
+            r'^[١٢٣٤٥٦٧٨٩٠]+[\.\)]\s+',
+            
+            # Devanagari numbering
+            r'^[०१२३४५६७८९]+[\.\)]\s+',
+            
+            # Chinese/Japanese numbering
+            r'^[一二三四五六七八九十百千]+[\.\)、]\s+',
+            r'^第[一二三四五六七八九十百千]+[章节条款项]\s+',
+            
+            # Task/checkbox lists
+            r'^\[\s*[xX✓✗]?\s*\]\s+',   # [ ], [x], [✓]
+            r'^☐\s+|^☑\s+|^☒\s+',        # Checkbox symbols
+        ]
+        
+        for pattern in list_patterns:
+            if re.match(pattern, line, re.UNICODE):
+                return True
+        
+        return False
+
+    def _find_list_end(self, text: str, start_pos: int, script_group: str) -> int:
+        """
+        Find the end of a list starting from the given position.
+        
+        Args:
+            text: Full text
+            start_pos: Position to start looking for list end
+            script_group: Script group for language-specific patterns
+            
+        Returns:
+            Position where the list ends
+        """
+        lines = text[start_pos:].split('\n')
+        
+        list_end_pos = start_pos
+        consecutive_non_list_lines = 0
+        in_list = False
+        
+        for i, line in enumerate(lines):
+            line_stripped = line.strip()
+            
+            # Check if this line is a list item
+            if self._is_list_item(line_stripped):
+                in_list = True
+                consecutive_non_list_lines = 0
+                # Update end position to include this line
+                list_end_pos = start_pos + len('\n'.join(lines[:i+1]))
+            
+            elif in_list:
+                # We were in a list, check if this line continues the list context
+                if self._is_list_continuation(line_stripped):
+                    # This line continues the previous list item (indented content, etc.)
+                    consecutive_non_list_lines = 0
+                    list_end_pos = start_pos + len('\n'.join(lines[:i+1]))
+                
+                elif line_stripped == '':
+                    # Empty line - might be separating list items
+                    consecutive_non_list_lines += 1
+                    if consecutive_non_list_lines >= 2:
+                        # Multiple empty lines likely end the list
+                        break
+                
+                else:
+                    # Non-list, non-empty line
+                    consecutive_non_list_lines += 1
+                    if consecutive_non_list_lines >= 1:
+                        # Non-list content likely ends the list
+                        break
+            
+            else:
+                # We haven't found a list yet
+                if line_stripped != '':
+                    consecutive_non_list_lines += 1
+                    if consecutive_non_list_lines >= 3:
+                        # No list found in reasonable distance
+                        break
+        
+        return min(list_end_pos + 1, len(text))  # Add 1 to include the newline
+
+    def _is_list_continuation(self, line: str) -> bool:
+        """
+        Check if a line is a continuation of a list item (like indented content).
+        
+        Args:
+            line: Line to check
+            
+        Returns:
+            True if line continues a list item
+        """
+        if not line.strip():
+            return True  # Empty lines can be part of list formatting
+        
+        # Check for indented content (common in list continuations)
+        if re.match(r'^\s{2,}[^\s\-\*\+•·]', line):
+            return True
+        
+        # Check for content that looks like it continues a list item
+        continuation_patterns = [
+            r'^\s+\w+',                 # Indented text
+            r'^\s*["\'"„"«»]',          # Quoted content (often in lists)
+            r'^\s*[\(\[][^0-9a-zA-Z]',  # Parenthetical content (not new list items)
+        ]
+        
+        for pattern in continuation_patterns:
+            if re.match(pattern, line):
+                return True
+        
+        return False
+        """Get the word for 'Part' in the given language."""
+        part_words = {
+            'en': 'Part', 'es': 'Parte', 'fr': 'Partie', 'de': 'Teil',
+            'it': 'Parte', 'pt': 'Parte', 'ru': 'Часть', 'zh': '部分',
+            'ja': 'パート', 'ko': '부분', 'ar': 'جزء', 'hi': 'भाग',
+            'th': 'ส่วน', 'he': 'חלק', 'bn': 'অংশ', 'ta': 'பகுதி'
+        }
+        return part_words.get(language, 'Part')
+        """Get the word for 'Section' in the given language."""
+        section_words = {
+            'en': 'Section', 'es': 'Sección', 'fr': 'Section', 'de': 'Abschnitt',
+            'it': 'Sezione', 'pt': 'Seção', 'ru': 'Раздел', 'zh': '章节',
+            'ja': 'セクション', 'ko': '섹션', 'ar': 'قسم', 'hi': 'खंड',
+            'th': 'ส่วน', 'he': 'סעיף', 'bn': 'বিভাগ', 'ta': 'பிரிவு'
+        }
+        return section_words.get(language, 'Section')
+
+    def _add_section_overlaps(self, sections: List[Tuple[str, str]], full_text: str,
+                            language: str, overlap_sentences: int) -> List[Tuple[str, str]]:
+        """Add overlapping content between adjacent sections."""
+        if len(sections) <= 1 or overlap_sentences <= 0:
+            return sections
+        
+        script_group = self.get_script_group(language)
+        sentence_endings = self._get_sentence_endings(script_group)
+        
+        overlapped_sections = []
+        
+        for i, (title, content) in enumerate(sections):
+            extended_content = content
+            
+            # Add overlap from previous section (suffix)
+            if i > 0:
+                prev_content = sections[i-1][1]
+                prev_sentences = self._split_sentences(prev_content, sentence_endings)
+                if len(prev_sentences) >= overlap_sentences:
+                    overlap_text = ' '.join(prev_sentences[-overlap_sentences:])
+                    extended_content = overlap_text + '\n\n' + extended_content
+            
+            # Add overlap from next section (prefix)
+            if i < len(sections) - 1:
+                next_content = sections[i+1][1]
+                next_sentences = self._split_sentences(next_content, sentence_endings)
+                if len(next_sentences) >= overlap_sentences:
+                    overlap_text = ' '.join(next_sentences[:overlap_sentences])
+                    extended_content = extended_content + '\n\n' + overlap_text
+            
+            overlapped_sections.append((title, extended_content))
+        
+        return overlapped_sections
+
+    def _split_sentences(self, text: str, sentence_endings: str) -> List[str]:
+        """Split text into sentences based on language-specific endings."""
+        sentences = []
+        current_sentence = ''
+        
+        for char in text:
+            current_sentence += char
+            if char in sentence_endings:
+                # Check if this is actually end of sentence (not abbreviation)
+                stripped = current_sentence.strip()
+                if stripped:
+                    sentences.append(stripped)
+                    current_sentence = ''
+        
+        # Add remaining text as last sentence if any
+        if current_sentence.strip():
+            sentences.append(current_sentence.strip())
+        
+        return sentences
+
+    def _ensure_complete_coverage(self, sections: List[Tuple[str, str]], 
+                                full_text: str, language: str) -> List[Tuple[str, str]]:
+        """Ensure all text is covered in sections, add missing parts if needed."""
+        if not sections:
+            return [("General", full_text)]
+        
+        # Create a simple coverage check by looking at unique phrases
+        covered_text = ' '.join([content for _, content in sections])
+        
+        # If original text is much longer than covered text, we might be missing content
+        if len(full_text) > len(covered_text) * 1.5:
+            # Add the full text as a comprehensive section
+            sections.append(("Complete Document", full_text))
+        
+        # Ensure we have at least one section with reasonable content
+        if all(len(content.strip()) < 50 for _, content in sections):
+            sections = [("General", full_text)]
+        
+        return sections
+
+    def _get_sentence_endings(self, script_group: str) -> str:
+        """Get sentence ending characters based on script group."""
+        endings = {
+            'latin': '.!?',
+            'cyrillic': '.!?',
+            'arabic': '.!?؟',
+            'cjk': '。！？',
+            'devanagari': '।!?',
+            'bengali': '।!?',
+            'dravidian': '।!?',
+            'thai': '.!?',
+            'greek': '.!?;',
+            'hebrew': '.!?',
+            'gurmukhi': '।!?',
+            'gujarati': '।!?',
+            'sinhala': '.!?',
+            'african': '.!?'
+        }
+        return endings.get(script_group, '.!?')
+
+    def _get_part_word(self, language: str) -> str:
+        """Get the word for 'Part' in the given language."""
+        part_words = {
+            'en': 'Part', 'es': 'Parte', 'fr': 'Partie', 'de': 'Teil',
+            'it': 'Parte', 'pt': 'Parte', 'ru': 'Часть', 'zh': '部分',
+            'ja': 'パート', 'ko': '부분', 'ar': 'جزء', 'hi': 'भाग',
+            'th': 'ส่วน', 'he': 'חלק', 'bn': 'অংশ', 'ta': 'பகுதி'
+        }
+        return part_words.get(language, 'Part')
+        """Get the word for 'Section' in the given language."""
+        section_words = {
+            'en': 'Section', 'es': 'Sección', 'fr': 'Section', 'de': 'Abschnitt',
+            'it': 'Sezione', 'pt': 'Seção', 'ru': 'Раздел', 'zh': '章节',
+            'ja': 'セクション', 'ko': '섹션', 'ar': 'قسم', 'hi': 'खंड',
+            'th': 'ส่วน', 'he': 'סעיף', 'bn': 'বিভাগ', 'ta': 'பிரிவு'
+        }
+        return section_words.get(language, 'Section')
+
+    def _add_section_overlaps(self, sections: List[Tuple[str, str]], full_text: str,
+                            language: str, overlap_sentences: int) -> List[Tuple[str, str]]:
+        """Add overlapping content between adjacent sections."""
+        if len(sections) <= 1 or overlap_sentences <= 0:
+            return sections
+        
+        script_group = self.get_script_group(language)
+        sentence_endings = self._get_sentence_endings(script_group)
+        
+        overlapped_sections = []
+        
+        for i, (title, content) in enumerate(sections):
+            extended_content = content
+            
+            # Add overlap from previous section (suffix)
+            if i > 0:
+                prev_content = sections[i-1][1]
+                prev_sentences = self._split_sentences(prev_content, sentence_endings)
+                if len(prev_sentences) >= overlap_sentences:
+                    overlap_text = ' '.join(prev_sentences[-overlap_sentences:])
+                    extended_content = overlap_text + '\n\n' + extended_content
+            
+            # Add overlap from next section (prefix)
+            if i < len(sections) - 1:
+                next_content = sections[i+1][1]
+                next_sentences = self._split_sentences(next_content, sentence_endings)
+                if len(next_sentences) >= overlap_sentences:
+                    overlap_text = ' '.join(next_sentences[:overlap_sentences])
+                    extended_content = extended_content + '\n\n' + overlap_text
+            
+            overlapped_sections.append((title, extended_content))
+        
+        return overlapped_sections
+
+
+    def _ensure_complete_coverage(self, sections: List[Tuple[str, str]], 
+                                full_text: str, language: str) -> List[Tuple[str, str]]:
+        """Ensure all text is covered in sections, add missing parts if needed."""
+        if not sections:
+            return [("General", full_text)]
+        
+        # Create a simple coverage check by looking at unique phrases
+        covered_text = ' '.join([content for _, content in sections])
+        
+        # If original text is much longer than covered text, we might be missing content
+        if len(full_text) > len(covered_text) * 1.5:
+            # Add the full text as a comprehensive section
+            sections.append(("Complete Document", full_text))
+        
+        # Ensure we have at least one section with reasonable content
+        if all(len(content.strip()) < 50 for _, content in sections):
+            sections = [("General", full_text)]
+        
+        return sections
+
+
+    def _identify_natural_sections(self, text: str, language: str, script_group: str) -> List[Tuple[str, str]]:
+        """Identify natural document sections using various patterns."""
+        
+        # Try Markdown-style headers first (universal format)
+        markdown_patterns = [
+            # Level 1-4 headers with content
+            (r'(?:^|\n)(#{1,4})\s+(.*?)(?:\n|$)((?:.|\n)*?)(?=\n#{1,4}|\Z)', 'markdown'),
+            # Alternative markdown with underlines
+            (r'(?:^|\n)(.+?)\n([=\-]{3,})\n((?:.|\n)*?)(?=\n.+?\n[=\-]{3,}|\Z)', 'underline')
+        ]
+        
+        for pattern, pattern_type in markdown_patterns:
+            matches = re.finditer(pattern, text, re.MULTILINE | re.DOTALL)
+            sections = []
+            for m in matches:
+                if pattern_type == 'markdown':
+                    title = m.group(2).strip()
+                    content = m.group(3).strip()
+                else:  # underline
+                    title = m.group(1).strip()
+                    content = m.group(3).strip()
+                
+                if content:  # Only add sections with actual content
+                    sections.append((title, content))
+            
+            if sections:
+                return sections
+        
+        # Try language-specific section headers
+        section_terms = self.get_section_headers(language)
+        sections = self._find_sections_by_headers(text, section_terms, script_group)
+        
+        if sections:
+            return sections
+        
+        # Try numbered sections
+        numbered_sections = self._find_numbered_sections(text, script_group)
+        if numbered_sections:
+            return numbered_sections
+        
+        # Try visual separators
+        separator_sections = self._find_separator_sections(text)
+        if separator_sections:
+            return separator_sections
+        
+        return []
+
+    def _find_sections_by_headers(self, text: str, section_terms: List[str], 
+                                script_group: str) -> List[Tuple[str, str]]:
+        """Find sections using language-specific headers."""
+        if not section_terms:
+            return []
+        
+        section_patterns = []
+        for term in section_terms:
+            if script_group in ['latin', 'cyrillic', 'greek']:
+                # Case-insensitive matching for Latin-based scripts
+                pattern = rf'(?:^|\n)(?:{re.escape(term)}|{re.escape(term.capitalize())}|{re.escape(term.upper())})\s*\d*[\.\:：]\s*([^\n]*?)(?:\n|$)'
+            else:
+                # For other scripts
+                pattern = rf'(?:^|\n){re.escape(term)}\s*\d*[\.\:：。]\s*([^\n]*?)(?:\n|$)'
+            section_patterns.append((pattern, term))
+        
+        all_headers = []
+        for pattern, term in section_patterns:
+            for match in re.finditer(pattern, text, re.MULTILINE | re.IGNORECASE):
+                start_pos = match.start()
+                header_text = match.group(1).strip() if match.group(1).strip() else term
+                all_headers.append((start_pos, header_text, match.end()))
+        
+        if not all_headers:
+            return []
+        
+        # Sort headers by position
+        all_headers.sort(key=lambda x: x[0])
+        
+        sections = []
+        for i, (start_pos, header, header_end) in enumerate(all_headers):
+            # Find content until next header or end of text
+            next_pos = all_headers[i + 1][0] if i + 1 < len(all_headers) else len(text)
+            content = text[header_end:next_pos].strip()
+            
+            if content:
+                sections.append((header, content))
+        
+        return sections
+
+    def _find_numbered_sections(self, text: str, script_group: str) -> List[Tuple[str, str]]:
+        """Find numbered sections based on script group."""
+        if script_group == 'cjk':
+            # CJK numbering patterns
+            patterns = [
+                r'(?:^|\n)([一二三四五六七八九十百千]+[\.．、])\s*([^\n]*?)(?:\n|$)',
+                r'(?:^|\n)([0-9]+[\.．、])\s*([^\n]*?)(?:\n|$)',
+                r'(?:^|\n)([第][一二三四五六七八九十百千]+[章节部分])\s*([^\n]*?)(?:\n|$)'
+            ]
+        elif script_group in ['devanagari', 'bengali', 'dravidian', 'gurmukhi', 'gujarati']:
+            # Indic script numbering
+            patterns = [
+                r'(?:^|\n)([०१२३४५६७८९]+[\.।])\s*([^\n]*?)(?:\n|$)',
+                r'(?:^|\n)(\d+[\.।])\s*([^\n]*?)(?:\n|$)'
+            ]
+        elif script_group == 'arabic':
+            # Arabic script numbering
+            patterns = [
+                r'(?:^|\n)([١٢٣٤٥٦٧٨٩٠]+[\.،])\s*([^\n]*?)(?:\n|$)',
+                r'(?:^|\n)(\d+[\.،])\s*([^\n]*?)(?:\n|$)'
+            ]
+        elif script_group == 'thai':
+            # Thai numbering
+            patterns = [
+                r'(?:^|\n)([๐๑๒๓๔๕๖๗๘๙]+[\.])\s*([^\n]*?)(?:\n|$)',
+                r'(?:^|\n)(\d+[\.])?\s*([^\n]*?)(?:\n|$)'
+            ]
+        else:
+            # Default Latin numbering
+            patterns = [
+                r'(?:^|\n)(\d+[\.]\s*[^\n]*?)(?:\n|$)',
+                r'(?:^|\n)([a-zA-Z]\.\s*[^\n]*?)(?:\n|$)',
+                r'(?:^|\n)([IVX]+\.\s*[^\n]*?)(?:\n|$)'
+            ]
+        
+        for pattern in patterns:
+            headers = list(re.finditer(pattern, text, re.MULTILINE))
+            if len(headers) >= 2:  # Need at least 2 sections
+                sections = []
+                for i, match in enumerate(headers):
+                    start_pos = match.start()
+                    if len(match.groups()) >= 2:
+                        number = match.group(1).strip()
+                        title = match.group(2).strip() if match.group(2) else f"Section {number}"
+                    else:
+                        title = match.group(1).strip()
+                    
+                    # Find content
+                    content_start = match.end()
+                    content_end = headers[i + 1].start() if i + 1 < len(headers) else len(text)
+                    content = text[content_start:content_end].strip()
+                    
+                    if content:
+                        sections.append((title, content))
+                
                 if sections:
                     return sections
         
-        # If still no sections, just return the whole text as one section
-        return [("General", text)]
+        return []
 
+    def _find_separator_sections(self, text: str) -> List[Tuple[str, str]]:
+        """Find sections separated by visual separators."""
+        separator_patterns = [
+            r'\n\s*[-=*_]{3,}\s*\n',  # Horizontal rules
+            r'\n\s*[•·]{3,}\s*\n',    # Bullet separators
+            r'\n\s*\n\s*\n',          # Multiple blank lines
+            r'\n\s*[~]{3,}\s*\n'      # Tilde separators
+        ]
+        
+        for pattern in separator_patterns:
+            parts = re.split(pattern, text)
+            if len(parts) > 1:
+                sections = []
+                for i, part in enumerate(parts):
+                    part = part.strip()
+                    if not part:
+                        continue
+                    
+                    # Try to extract title from first line
+                    lines = part.split('\n', 1)
+                    if len(lines) > 1 and len(lines[0].strip()) < 100:
+                        title = lines[0].strip()
+                        content = lines[1].strip()
+                    else:
+                        title = f"Section {i + 1}"
+                        content = part
+                    
+                    if content:
+                        sections.append((title, content))
+                
+                if len(sections) > 1:
+                    return sections
+        
+        return []
+
+    def _create_chunked_sections(self, text: str, language: str, script_group: str,
+                            max_section_length: int, min_section_length: int) -> List[Tuple[str, str]]:
+        """Create artificial sections by chunking the text intelligently."""
+        if len(text) <= max_section_length:
+            return [("General", text)]
+        
+        # Get sentence boundaries based on script group
+        sentence_endings = self._get_sentence_endings(script_group)
+        
+        sections = []
+        current_pos = 0
+        section_num = 1
+        
+        while current_pos < len(text):
+            # Find a good breaking point within max_section_length
+            end_pos = min(current_pos + max_section_length, len(text))
+            
+            # Try to break at sentence boundary
+            best_break = end_pos
+            for i in range(end_pos - 1, max(current_pos + min_section_length, end_pos - 200), -1):
+                if text[i] in sentence_endings and i > current_pos + min_section_length:
+                    best_break = i + 1
+                    break
+            
+            # If no good sentence break found, try paragraph break
+            if best_break == end_pos and end_pos < len(text):
+                for i in range(end_pos - 1, max(current_pos + min_section_length, end_pos - 100), -1):
+                    if text[i:i+2] == '\n\n':
+                        best_break = i + 2
+                        break
+            
+            section_content = text[current_pos:best_break].strip()
+            if section_content:
+                # Generate meaningful title from first line or sentences
+                title = self._generate_section_title(section_content, section_num, language)
+                sections.append((title, section_content))
+                section_num += 1
+            
+            current_pos = best_break
+        
+        return sections
+
+
+    def _generate_section_title(self, content: str, section_num: int, language: str) -> str:
+        """Generate a meaningful title for a section."""
+        lines = content.split('\n')
+        first_line = lines[0].strip()
+        
+        # If first line is short and looks like a title, use it
+        if len(first_line) < 80 and not first_line.endswith(('.', '。', '।', '؟', '?', '!')):
+            return first_line
+        
+        # Try to extract key phrases from first sentence
+        first_sentence = first_line
+        sentence_endings = self._get_sentence_endings(self.get_script_group(language))
+        
+        for ending in sentence_endings:
+            if ending in first_line:
+                first_sentence = first_line[:first_line.index(ending) + 1]
+                break
+        
+        # If sentence is reasonable length for a title
+        if 10 < len(first_sentence) < 80:
+            return first_sentence.strip()
+        
+        # Fallback to generic title
+        section_word = self._get_section_word(language)
+        return f"{section_word} {section_num}"
+
+    def _get_section_word(self, language: str) -> str:
+        """Get the word for 'Section' in the given language."""
+        section_words = {
+            'en': 'Section', 'es': 'Sección', 'fr': 'Section', 'de': 'Abschnitt',
+            'it': 'Sezione', 'pt': 'Seção', 'ru': 'Раздел', 'zh': '章节',
+            'ja': 'セクション', 'ko': '섹션', 'ar': 'قسم', 'hi': 'खंड',
+            'th': 'ส่วน', 'he': 'סעיף', 'bn': 'বিভাগ', 'ta': 'பிரிவு'
+        }
+        return section_words.get(language, 'Section')
+
+
+    def _split_sentences(self, text: str, sentence_endings: str) -> List[str]:
+        """Split text into sentences based on language-specific endings."""
+        sentences = []
+        current_sentence = ''
+        
+        for char in text:
+            current_sentence += char
+            if char in sentence_endings:
+                # Check if this is actually end of sentence (not abbreviation)
+                stripped = current_sentence.strip()
+                if stripped:
+                    sentences.append(stripped)
+                    current_sentence = ''
+        
+        # Add remaining text as last sentence if any
+        if current_sentence.strip():
+            sentences.append(current_sentence.strip())
+        
+        return sentences
+
+  
     def extract_qa_pairs(self, text: str, language: str) -> List[Tuple[str, str]]:
         """
         Extract question-answer pairs with language-specific patterns.
@@ -972,30 +2263,18 @@ class MultilingualMessageProcessor:
         logger.info(f"doc_type: {doc_type}")
         chunks = []
         
-        # Add a full document chunk first to ensure nothing is lost
-        full_doc_chunk = Chunk(
-            text=text,
-            section="Full Document",
-            type="full_document",
-            metadata=ChunkMetadata(
-                hasQuestion=False,
-                documentType=doc_type,
-                language=language,
-                chunkIndex=0,
-                totalChunks=0,  # Will update later
-                isFullDocument=True
-            )
-        )
-        chunks.append(full_doc_chunk)
         
         # Identify document sections
         sections = self.identify_document_sections(text, language)
         
+        # logger.info(f"Sections:  {sections}")  
+           
         # Process each section
         for section_idx, (section_title, section_content) in enumerate(sections):
             if not section_content.strip():
                 continue
-                
+            
+   
             # Add section-level chunk to preserve section integrity
             section_chunk = Chunk(
                 text=f"Section: {section_title}\n\n{section_content}",
@@ -1781,6 +3060,7 @@ class MultilingualMessageProcessor:
             except Exception as e:
                 logger.warning(f"Could not update index mapping: {str(e)}")
 
+
     async def extract_keywords_and_context_with_mistral(self, text: str, section_title: str = "", language: str = 'en', max_keywords: int = 20) -> Dict[str, Any]:
         """
         Extract keywords and context summary dynamically using Mistral for any language and domain
@@ -1792,10 +3072,10 @@ class MultilingualMessageProcessor:
             max_keywords: Maximum number of keywords to extract
             
         Returns:
-            Dictionary containing keywords, context summary, and metadata
+            Dictionary containing keywords and context summary only
         """
         try:
-            # Enhanced system prompt for both keyword extraction and context generation
+            # Simplified system prompt for only keywords and context_summary
             system_prompt = f"""Extract {max_keywords} keywords and create a context summary from the text. Return ONLY JSON:
     {{
         "keywords": ["word1", "phrase1", "concept1"],
@@ -1831,7 +3111,7 @@ class MultilingualMessageProcessor:
                 "temperature": 0.1
             }
 
-            logger.info(f"Extracting keywords and context for chunk in language: {language}, data: {data}")
+            # logger.info(f"Extracting keywords and context for chunk in language: {language}, data: {data}")
             
             response = await self.http_client.post(
                 MISTRAL_CONFIG['chat_url'],
@@ -1848,21 +3128,40 @@ class MultilingualMessageProcessor:
 
             response_data = response.json()
             
-            logger.info(f"Mistral response received for keyword and context extraction, response_data: {response_data}")
+            # logger.info(f"Mistral response received for keyword and context extraction, response_data: {response_data}")
+            # Extract durations (they are in nanoseconds)
+            total_duration_ns = response_data.get("total_duration", 0)
+            load_duration_ns = response_data.get("load_duration", 0)
+            prompt_eval_duration_ns = response_data.get("prompt_eval_duration", 0)
+            eval_duration_ns = response_data.get("eval_duration", 0)
 
-            if 'choices' in response_data and len(response_data['choices']) > 0:
-                content = response_data['choices'][0]['message']['content'].strip()
-                logger.info(f"Extracted content from Mistral: {content}")
+            # Convert to seconds
+            total_duration_sec = total_duration_ns / 1e9
+            load_duration_sec = load_duration_ns / 1e9
+            prompt_eval_duration_sec = prompt_eval_duration_ns / 1e9
+            eval_duration_sec = eval_duration_ns / 1e9
+
+            # Print in seconds
+            logger.info(
+                f"Mistral durations (in seconds): "
+                f"total={total_duration_sec:.3f}s, "
+                f"load={load_duration_sec:.3f}s, "
+                f"prompt_eval={prompt_eval_duration_sec:.3f}s, "
+                f"eval={eval_duration_sec:.3f}s"
+            )
+            if 'message' in response_data and 'content' in response_data['message']:
+                content = response_data['message']['content'].strip()
+                # logger.info(f"Extracted content from Mistral: {content}")
                 
                 try:
                     # Parse JSON response
                     extraction_data = json.loads(content)
-                    logger.info(f"Successfully parsed JSON: {extraction_data}")
+                    # logger.info(f"Successfully parsed JSON: {extraction_data}")
                     
                     # Validate and process the response
                     processed_data = self._process_mistral_extraction(extraction_data, text, section_title, max_keywords)
                     
-                    logger.info(f"Successfully extracted {len(processed_data.get('keywords', []))} keywords and context")
+                    # logger.info(f"Successfully extracted {len(processed_data.get('keywords', []))} keywords and context")
                     return processed_data
                     
                 except json.JSONDecodeError as e:
@@ -1870,7 +3169,7 @@ class MultilingualMessageProcessor:
                     logger.error(f"Raw response: {content}")
                     return self._extract_from_text_response(content, text, section_title, max_keywords)
             
-            logger.error("No choices in response or empty choices")
+            logger.error("No message in response or missing content")
             return self._fallback_extraction(text, section_title, language, max_keywords)
             
         except Exception as e:
@@ -1881,7 +3180,7 @@ class MultilingualMessageProcessor:
     
     def _process_mistral_extraction(self, extraction_data: Dict, text: str, section_title: str, max_keywords: int) -> Dict[str, Any]:
         """
-        Process and validate Mistral extraction response
+        Process and validate Mistral extraction response - simplified to only handle keywords and context_summary
         
         Args:
             extraction_data: Raw data from Mistral
@@ -1890,14 +3189,11 @@ class MultilingualMessageProcessor:
             max_keywords: Maximum keywords
             
         Returns:
-            Processed extraction data
+            Processed extraction data with only keywords and context_summary
         """
         processed = {
             "keywords": [],
-            "context_summary": "",
-            "content_type": "general",
-            "key_topics": [],
-            "extraction_method": "mistral"
+            "context_summary": ""
         }
         
         # Process keywords
@@ -1911,6 +3207,9 @@ class MultilingualMessageProcessor:
                     if len(cleaned) > 2 and cleaned not in ['the', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for', 'of', 'with', 'by']:
                         keywords.append(keyword.strip())
             processed["keywords"] = keywords
+        else:
+            # Fallback keywords extraction
+            processed["keywords"] = self._extract_fallback_keywords(text, max_keywords)
         
         # Process context summary
         if 'context_summary' in extraction_data and isinstance(extraction_data['context_summary'], str):
@@ -1922,92 +3221,126 @@ class MultilingualMessageProcessor:
         else:
             processed["context_summary"] = self._create_fallback_summary(text, section_title)
         
-        # Process content type
-        if 'content_type' in extraction_data and isinstance(extraction_data['content_type'], str):
-            content_type = extraction_data['content_type'].strip()
-            if len(content_type) > 0:  # Accept any non-empty content type
-                processed["content_type"] = content_type
-        
-        # Process key topics
-        if 'key_topics' in extraction_data and isinstance(extraction_data['key_topics'], list):
-            topics = [topic.strip() for topic in extraction_data['key_topics'][:5] if isinstance(topic, str) and len(topic.strip()) > 2]
-            processed["key_topics"] = topics
-        
-        # Process detected language
-        # Language is already known, no need to detect again
-        
         return processed
+
+    def _extract_fallback_keywords(self, text: str, max_keywords: int) -> List[str]:
+        """
+        Extract keywords using simple frequency analysis
+        
+        Args:
+            text: Text to process
+            max_keywords: Maximum keywords to extract
+            
+        Returns:
+            List of keywords
+        """
+        # Simple keyword extraction
+        words = text.lower().split()
+        word_freq = {}
+        
+        for word in words:
+            word = word.strip('.,;:!?()[]{}')
+            if len(word) > 3 and word not in ['the', 'and', 'or', 'but', 'with', 'from', 'this', 'that', 'they', 'have', 'been', 'were']:
+                word_freq[word] = word_freq.get(word, 0) + 1
+        
+        # Get most frequent words as keywords
+        keywords = sorted(word_freq.items(), key=lambda x: x[1], reverse=True)[:max_keywords]
+        keyword_list = [word for word, freq in keywords]
+        
+        return keyword_list
+
+    def _fallback_extraction(self, text: str, section_title: str, language: str, max_keywords: int) -> Dict[str, Any]:
+        """
+        Fallback extraction when Mistral fails - simplified to only return keywords and context_summary
+        
+        Args:
+            text: Text to process
+            section_title: Section title
+            language: Language code
+            max_keywords: Maximum keywords
+            
+        Returns:
+            Basic extraction data with only keywords and context_summary
+        """
+        logger.info("Using fallback extraction method")
+        
+        # Extract keywords using simple method
+        keywords = self._extract_fallback_keywords(text, max_keywords)
+        
+        # Create basic summary
+        summary = self._create_fallback_summary(text, section_title)
+        
+        return {
+            "keywords": keywords,
+            "context_summary": summary
+        }
+        
+    def _create_fallback_summary(self, text: str, section_title: str) -> str:
+        """Create a simple fallback summary"""
+        # Use first sentence or first 100 characters
+        sentences = text.split('.')
+        if sentences and len(sentences[0].strip()) > 10:
+            summary = sentences[0].strip() + '.'
+        else:
+            summary = text[:100].strip() + '...'
+        
+        # Add section context if available
+        if section_title and section_title != "General":
+            summary = f"Content from {section_title}: {summary}"
+        
+        return summary
 
     def _extract_from_text_response(self, content: str, text: str, section_title: str, max_keywords: int) -> Dict[str, Any]:
         """
-        Extract information from non-JSON Mistral response
+        Extract keywords and summary from non-JSON text response
         
         Args:
             content: Raw text response from Mistral
-            text: Original text
+            text: Original text for fallback
             section_title: Section title
             max_keywords: Maximum keywords
             
         Returns:
-            Extracted data
+            Extracted data with keywords and context_summary
         """
-        logger.info("Attempting to parse non-JSON Mistral response")
+        logger.info("Attempting to extract from text response")
         
-        extracted = {
-            "keywords": [],
-            "context_summary": "",
-            "content_type": "general",
-            "key_topics": [],
-            "extraction_method": "text_parsing"
-        }
-        
+        # Try to find keywords in the response
+        keywords = []
         lines = content.split('\n')
-        current_section = None
         
         for line in lines:
             line = line.strip()
-            if not line:
-                continue
-                
-            # Look for keywords section
-            if 'keyword' in line.lower() and ':' in line:
-                current_section = 'keywords'
-                # Try to extract keywords from the same line
-                if line.count(':') == 1:
-                    keywords_part = line.split(':', 1)[1].strip()
-                    if keywords_part:
-                        extracted["keywords"].extend(self._parse_keywords_from_text(keywords_part))
-            
-            # Look for context/summary section
-            elif any(term in line.lower() for term in ['context', 'summary', 'purpose']) and ':' in line:
-                current_section = 'context'
-                if line.count(':') == 1:
-                    context_part = line.split(':', 1)[1].strip()
-                    if context_part and len(context_part) > 10:
-                        extracted["context_summary"] = context_part
-            
-            # Look for content type
-            elif 'type' in line.lower() and ':' in line:
-                if line.count(':') == 1:
-                    type_part = line.split(':', 1)[1].strip()
-                    if len(type_part) > 0:  # Accept any non-empty content type
-                        extracted["content_type"] = type_part
-            
-            # Continue parsing based on current section
-            elif current_section == 'keywords' and line:
-                extracted["keywords"].extend(self._parse_keywords_from_text(line))
-            elif current_section == 'context' and line and len(line) > 10:
-                if not extracted["context_summary"]:
-                    extracted["context_summary"] = line
+            # Look for keyword-like patterns
+            if any(keyword_indicator in line.lower() for keyword_indicator in ['keyword', 'key', 'term', 'concept']):
+                # Extract potential keywords from this line
+                words = line.split()
+                for word in words:
+                    cleaned = word.strip('.,;:!?()[]{}')
+                    if (len(cleaned) > 2 and 
+                        cleaned.lower() not in ['keywords', 'key', 'terms', 'concepts', 'the', 'and', 'or'] and
+                        len(keywords) < max_keywords):
+                        keywords.append(cleaned)
         
-        # Clean up keywords
-        extracted["keywords"] = list(dict.fromkeys(extracted["keywords"][:max_keywords]))  # Remove duplicates
+        # If no keywords found, use fallback
+        if not keywords:
+            keywords = self._extract_fallback_keywords(text, max_keywords)
         
-        # Fallback for missing context
-        if not extracted["context_summary"]:
-            extracted["context_summary"] = self._create_fallback_summary(text, section_title)
+        # Try to find summary in the response
+        summary = ""
+        for line in lines:
+            if len(line.strip()) > 20:  # Look for longer lines that might be summaries
+                summary = line.strip()
+                break
         
-        return extracted
+        # If no summary found, create fallback
+        if not summary:
+            summary = self._create_fallback_summary(text, section_title)
+        
+        return {
+            "keywords": keywords[:max_keywords],
+            "context_summary": summary
+        }
 
     def _parse_keywords_from_text(self, text: str) -> List[str]:
         """Parse keywords from text line"""
@@ -2035,150 +3368,7 @@ class MultilingualMessageProcessor:
         
         return keywords
 
-    def _create_fallback_summary(self, text: str, section_title: str) -> str:
-        """Create a simple fallback summary"""
-        # Use first sentence or first 100 characters
-        sentences = text.split('.')
-        if sentences and len(sentences[0].strip()) > 10:
-            summary = sentences[0].strip() + '.'
-        else:
-            summary = text[:100].strip() + '...'
         
-        # Add section context if available
-        if section_title and section_title != "General":
-            summary = f"Content from {section_title}: {summary}"
-        
-        return summary
-
-    def _fallback_extraction(self, text: str, section_title: str, language: str, max_keywords: int) -> Dict[str, Any]:
-        """
-        Fallback extraction when Mistral fails
-        
-        Args:
-            text: Text to process
-            section_title: Section title
-            language: Language code
-            max_keywords: Maximum keywords
-            
-        Returns:
-            Basic extraction data
-        """
-        logger.info("Using fallback extraction method")
-        
-        # Simple keyword extraction
-        words = text.lower().split()
-        word_freq = {}
-        
-        for word in words:
-            word = word.strip('.,;:!?()[]{}')
-            if len(word) > 3 and word not in ['the', 'and', 'or', 'but', 'with', 'from', 'this', 'that', 'they', 'have', 'been', 'were']:
-                word_freq[word] = word_freq.get(word, 0) + 1
-        
-        # Get most frequent words as keywords
-        keywords = sorted(word_freq.items(), key=lambda x: x[1], reverse=True)[:max_keywords]
-        keyword_list = [word for word, freq in keywords]
-        
-        # Create basic summary
-        summary = self._create_fallback_summary(text, section_title)
-        
-        return {
-            "keywords": keyword_list,
-            "context_summary": summary,
-            "content_type": "general",
-            "key_topics": keyword_list[:3],
-            "extraction_method": "fallback"
-        }
-        
-    def _validate_and_clean_keywords(self, keywords_data: Dict, max_keywords: int) -> Dict[str, List[str]]:
-        """Validate and clean the keywords extracted by Mistral"""
-        
-        default_structure = {
-            "primary_keywords": [],
-            "key_phrases": [],
-            "domain_concepts": [],
-            "action_words": [],
-            "semantic_variations": []
-        }
-        
-        # Ensure all required keys exist
-        for key in default_structure:
-            if key not in keywords_data:
-                keywords_data[key] = []
-        
-        # Clean and validate each category
-        cleaned = {}
-        total_keywords = 0
-        
-        for category, keywords in keywords_data.items():
-            if category in default_structure:
-                # Clean keywords
-                clean_keywords = []
-                for keyword in keywords:
-                    if isinstance(keyword, str):
-                        keyword = keyword.strip().lower()
-                        # Basic validation
-                        if (len(keyword) > 1 and 
-                            len(keyword) < 50 and 
-                            not keyword.isdigit() and
-                            total_keywords < max_keywords):
-                            clean_keywords.append(keyword)
-                            total_keywords += 1
-                
-                cleaned[category] = clean_keywords
-        
-        return cleaned
-
-    def _extract_from_text_response(self, content: str, max_keywords: int) -> Dict[str, List[str]]:
-        """Extract keywords from non-JSON text response"""
-        
-        # Try to find keyword lists in the response
-        keywords = []
-        
-        # Look for lines that contain keywords
-        lines = content.split('\n')
-        for line in lines:
-            line = line.strip()
-            if line and not line.startswith('{') and not line.startswith('}'):
-                # Remove bullets, numbers, and other prefixes
-                cleaned_line = re.sub(r'^[-*•\d\.\)\]]\s*', '', line)
-                if len(cleaned_line) > 1 and len(cleaned_line) < 50:
-                    keywords.append(cleaned_line.lower().strip())
-        
-        # Distribute keywords across categories
-        total = min(len(keywords), max_keywords)
-        return {
-            "primary_keywords": keywords[:total//2],
-            "key_phrases": keywords[total//2:total//2 + total//4],
-            "domain_concepts": keywords[total//2 + total//4:total//2 + total//2],
-            "action_words": keywords[total//2 + total//2:total],
-            "semantic_variations": []
-        }
-
-    def _fallback_keyword_extraction(self, text: str, language: str, max_keywords: int) -> Dict[str, List[str]]:
-        """Simple fallback keyword extraction when Mistral is not available"""
-        
-        # Basic text processing
-        words = re.findall(r'\b\w+\b', text.lower())
-        
-        # Simple frequency-based extraction
-        word_freq = {}
-        for word in words:
-            if len(word) > 3 and word.isalpha():
-                word_freq[word] = word_freq.get(word, 0) + 1
-        
-        # Get most frequent words
-        sorted_words = sorted(word_freq.items(), key=lambda x: (x[1], len(x[0])), reverse=True)
-        top_words = [word for word, freq in sorted_words[:max_keywords]]
-        
-        return {
-            "primary_keywords": top_words[:max_keywords//2],
-            "key_phrases": [],
-            "domain_concepts": top_words[max_keywords//2:],
-            "action_words": [],
-            "semantic_variations": []
-        }
-
-
     async def process_document_message_simplified(self, message: Dict[str, Any]):
         """
         Simplified document processing with essential keyword extraction
@@ -2202,7 +3392,7 @@ class MultilingualMessageProcessor:
         # Extract semantic chunks with language awareness
         chunks = self.extract_chunks(content, language)
         logger.info(f"Extracted {len(chunks)} semantic chunks from document")
-        logger.info(f"chunks data: {(chunks)} ")
+        # logger.info(f"chunks data: {(chunks)} ")
         # Process and index each chunk
         indexing_tasks = []
         for i, chunk in enumerate(chunks):
@@ -2282,14 +3472,13 @@ class MultilingualMessageProcessor:
         # Wait for all indexing tasks to complete
         await asyncio.gather(*indexing_tasks)
         
-        processed_doc_ids = set()        
-        processed_doc_ids.add(document_id)
+
         await self.publish_kafka_message(
             self.response_topic,
             tenant_id,
             DataStorageDto(
                 tenantId=tenant_id,
-                storedIds=list(processed_doc_ids),
+                storedIds=[document_id],
                 isDone=True,
                 dataType ='doc'
             )
