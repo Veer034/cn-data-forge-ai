@@ -24,3 +24,11 @@ ES_CONFIG = {
     'ssl_show_warn': True,
     'tenant_document_index_name': os.getenv('ES_TENANT_DOCUMENTS_VECTOR_INDEX_NAME', 'tenant-documents-vector')
 }
+
+MISTRAL_CONFIG = {
+    'chat_url': os.getenv('MISTRAL_CHAT_URL', 'http://localhost:11434/api/chat'),
+    'version_url': os.getenv('MISTRAL_VERSION_URL', 'http://localhost:11434/api/version'),
+    'model': os.getenv('MISTRAL_MODEL', 'mistral'),
+    'timeout': 120,
+}
+

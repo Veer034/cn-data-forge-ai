@@ -7,6 +7,7 @@ import uuid
 import os
 import signal
 import sys
+import httpx
 from pathlib import Path
 from logging.handlers import RotatingFileHandler
 from typing import List, Dict, Any, Optional, Tuple, Set
@@ -14,12 +15,12 @@ from sentence_transformers import SentenceTransformer
 from elasticsearch import AsyncElasticsearch
 from confluent_kafka import Consumer, Producer, KafkaError
 from pydantic import BaseModel
-from config import KAFKA_CONFIG,ES_CONFIG
+from config import KAFKA_CONFIG,ES_CONFIG,MISTRAL_CONFIG
 from libaryLanguage import LibraryLanguageDetector
 from contextvars import ContextVar
 
 
-tracking_id_var = ContextVar("tracking_id", default="NA")
+tracking_id_var = ContextVar("X-Tracking-ID", default="NA")
 
 
 class DataStorageDto(BaseModel):
@@ -36,6 +37,7 @@ class ChunkMetadata(BaseModel):
     question: Optional[str] = None
     chunkIndex: int = 0
     totalChunks: int = 1
+    sectionIndex: int = 0
 
 class Chunk(BaseModel):
     text: str
@@ -71,7 +73,7 @@ class MultilingualMessageProcessor:
         
         self.es_config = es_config
         self.kafka_config = kafka_config
-        
+        self.http_client = httpx.AsyncClient(timeout=300.0)
         # Initialize SentenceTransformer with multilingual model
         logger.info("Initializing SentenceTransformer model...")
         model_name = 'paraphrase-multilingual-mpnet-base-v2'
@@ -956,24 +958,60 @@ class MultilingualMessageProcessor:
     def extract_chunks(self, text: str, language: str) -> List[Chunk]:
         """
         Extract semantic chunks from text with language-aware processing.
+        Ensures ALL data is preserved in chunks for FAQ systems.
         
         Args:
             text: Document text
             language: Language code
             
         Returns:
-            List of Chunk objects
+            List of Chunk objects containing ALL original data
         """
         # Detect document type
         doc_type = self.detect_document_type(text, language)
         logger.info(f"doc_type: {doc_type}")
         chunks = []
         
+        # Add a full document chunk first to ensure nothing is lost
+        full_doc_chunk = Chunk(
+            text=text,
+            section="Full Document",
+            type="full_document",
+            metadata=ChunkMetadata(
+                hasQuestion=False,
+                documentType=doc_type,
+                language=language,
+                chunkIndex=0,
+                totalChunks=0,  # Will update later
+                isFullDocument=True
+            )
+        )
+        chunks.append(full_doc_chunk)
+        
         # Identify document sections
         sections = self.identify_document_sections(text, language)
         
         # Process each section
         for section_idx, (section_title, section_content) in enumerate(sections):
+            if not section_content.strip():
+                continue
+                
+            # Add section-level chunk to preserve section integrity
+            section_chunk = Chunk(
+                text=f"Section: {section_title}\n\n{section_content}",
+                section=section_title,
+                type="section",
+                metadata=ChunkMetadata(
+                    hasQuestion=False,
+                    documentType=doc_type,
+                    language=language,
+                    chunkIndex=len(chunks),
+                    totalChunks=0,  # Will update later
+                    sectionIndex=section_idx
+                )
+            )
+            chunks.append(section_chunk)
+            
             # Determine appropriate processing for this section
             if doc_type == 'faq' or any(term in section_title.lower() for term in self.get_faq_terms(language)):
                 # Process as FAQ section
@@ -981,7 +1019,8 @@ class MultilingualMessageProcessor:
                 
                 if qa_pairs:
                     for i, (question, answer) in enumerate(qa_pairs):
-                        chunks.append(Chunk(
+                        # Create individual Q&A chunks for precise matching
+                        qa_chunk = Chunk(
                             text=f"Q: {question}\nA: {answer}",
                             section=section_title,
                             type="qa_pair",
@@ -991,128 +1030,75 @@ class MultilingualMessageProcessor:
                                 language=language,
                                 qaFormat="explicit",
                                 question=question,
+                                answer=answer,
                                 chunkIndex=len(chunks),
-                                totalChunks=0  # Will update later
+                                totalChunks=0,  # Will update later
+                                sectionIndex=section_idx,
+                                qaPairIndex=i
                             )
-                        ))
-                else:
-                    # No Q&A pairs found, process as regular text
-                    content_chunks = self.chunk_text(section_content, language)
-                    
-                    for i, chunk_text in enumerate(content_chunks):
-                        chunks.append(Chunk(
-                            text=chunk_text,
-                            section=section_title,
-                            type="content",
-                            metadata=ChunkMetadata(
-                                hasQuestion=False,
-                                documentType=doc_type,
-                                language=language,
-                                chunkIndex=len(chunks),
-                                totalChunks=0  # Will update later
-                            )
-                        ))
-            elif doc_type == 'policy' or any(term in section_title.lower() for term in self.get_policy_terms(language)):
-                # Process as policy section
-                
-                # Look for numbered clauses
-                script_group = self.get_script_group(language)
-                if script_group == 'cjk':
-                    # For CJK
-                    clause_pattern = r'(?:^|\n)\s*(?:\d+|[一二三四五六七八九十]+)[\.．、]\s*(.*?)(?=\n\s*(?:\d+|[一二三四五六七八九十]+)[\.．、]|\Z)'
-                elif script_group in ['devanagari', 'bengali', 'dravidian', 'gurmukhi', 'gujarati']:
-                    # For Indic scripts
-                    clause_pattern = r'(?:^|\n)\s*(?:\d+|[१२३४५६७८९०]+)[\.।]\s*(.*?)(?=\n\s*(?:\d+|[१२३४५६७८९०]+)[\.।]|\Z)'
-                elif script_group == 'arabic':
-                    # For Arabic script
-                    clause_pattern = r'(?:^|\n)\s*(?:\d+|[١٢٣٤٥٦٧٨٩٠]+)[\.،]\s*(.*?)(?=\n\s*(?:\d+|[١٢٣٤٥٦٧٨٩٠]+)[\.،]|\Z)'
-                else:
-                    # Default pattern 
-                    clause_pattern = r'(?:^|\n)\s*\d+\.\s*(.*?)(?=\n\s*\d+\.|\Z)'
-                
-                clauses = []
-                for match in re.finditer(clause_pattern, section_content, re.DOTALL):
-                    clauses.append(match.group(1).strip())
-                
-                if clauses:
-                    # Process clauses
-                    current_clauses = []
-                    current_size = 0
-                    max_size = 300  # max words per chunk
-                    
-                    for clause in clauses:
-                        clause_size = len(clause.split())
+                        )
+                        chunks.append(qa_chunk)
                         
-                        if current_size + clause_size > max_size and current_clauses:
-                            # Save current chunk
-                            chunk_text = "\n\n".join(current_clauses)
-                            chunks.append(Chunk(
-                                text=chunk_text,
+                        # Also create separate question and answer chunks for better search
+                        question_chunk = Chunk(
+                            text=question,
+                            section=section_title,
+                            type="question",
+                            metadata=ChunkMetadata(
+                                hasQuestion=True,
+                                documentType='faq',
+                                language=language,
+                                qaFormat="question_only",
+                                question=question,
+                                relatedAnswer=answer,
+                                chunkIndex=len(chunks),
+                                totalChunks=0,
+                                sectionIndex=section_idx,
+                                qaPairIndex=i
+                            )
+                        )
+                        chunks.append(question_chunk)
+                        
+                        # Only add answer chunk if it's substantial
+                        if len(answer.strip()) > 10:
+                            answer_chunk = Chunk(
+                                text=answer,
                                 section=section_title,
-                                type="policy_clauses",
+                                type="answer",
                                 metadata=ChunkMetadata(
                                     hasQuestion=False,
-                                    documentType='policy',
+                                    documentType='faq',
                                     language=language,
+                                    qaFormat="answer_only",
+                                    relatedQuestion=question,
                                     chunkIndex=len(chunks),
-                                    totalChunks=0  # Will update later
+                                    totalChunks=0,
+                                    sectionIndex=section_idx,
+                                    qaPairIndex=i
                                 )
-                            ))
-                            current_clauses = [clause]
-                            current_size = clause_size
-                        else:
-                            current_clauses.append(clause)
-                            current_size += clause_size
-                    
-                    # Add remaining clauses
-                    if current_clauses:
-                        chunk_text = "\n\n".join(current_clauses)
-                        chunks.append(Chunk(
-                            text=chunk_text,
-                            section=section_title,
-                            type="policy_clauses",
-                            metadata=ChunkMetadata(
-                                hasQuestion=False,
-                                documentType='policy',
-                                language=language,
-                                chunkIndex=len(chunks),
-                                totalChunks=0  # Will update later
                             )
-                        ))
-                else:
-                    # No clauses found, process as regular text
-                    content_chunks = self.chunk_text(section_content, language)
+                            chunks.append(answer_chunk)
+                
+                # Always process the remaining content as well to catch any non-Q&A text
+                remaining_content = self._extract_non_qa_content(section_content, qa_pairs, language)
+                if remaining_content.strip():
+                    content_chunks = self.chunk_text_preserving_data(remaining_content, language, section_title, section_idx)
+                    chunks.extend(content_chunks)
                     
-                    for i, chunk_text in enumerate(content_chunks):
-                        chunks.append(Chunk(
-                            text=chunk_text,
-                            section=section_title,
-                            type="policy_content",
-                            metadata=ChunkMetadata(
-                                hasQuestion=False,
-                                documentType='policy',
-                                language=language,
-                                chunkIndex=len(chunks),
-                                totalChunks=0  # Will update later
-                            )
-                        ))
+            elif doc_type == 'policy' or any(term in section_title.lower() for term in self.get_policy_terms(language)):
+                # Process as policy section
+                policy_chunks = self._process_policy_section(section_content, section_title, language, section_idx)
+                chunks.extend(policy_chunks)
+                
             else:
                 # Process as general content
-                content_chunks = self.chunk_text(section_content, language)
-                
-                for i, chunk_text in enumerate(content_chunks):
-                    chunks.append(Chunk(
-                        text=chunk_text,
-                        section=section_title,
-                        type="content",
-                        metadata=ChunkMetadata(
-                            hasQuestion=False,
-                            documentType=doc_type,
-                            language=language,
-                            chunkIndex=len(chunks),
-                            totalChunks=0  # Will update later
-                        )
-                    ))
+                content_chunks = self.chunk_text_preserving_data(section_content, language, section_title, section_idx)
+                chunks.extend(content_chunks)
+        
+        # If no sections were found, process the entire text as content
+        if len(sections) <= 1 and sections[0][0] == "General":
+            content_chunks = self.chunk_text_preserving_data(text, language, "General", 0)
+            chunks.extend(content_chunks)
         
         # Update total chunks count
         total_chunks = len(chunks)
@@ -1120,6 +1106,439 @@ class MultilingualMessageProcessor:
             chunk.metadata.totalChunks = total_chunks
             
         return chunks
+
+    def _extract_non_qa_content(self, text: str, qa_pairs: List[Tuple[str, str]], language: str) -> str:
+        """
+        Extract content that is not part of Q&A pairs to ensure nothing is lost.
+        
+        Args:
+            text: Original section text
+            qa_pairs: Extracted Q&A pairs
+            language: Language code
+            
+        Returns:
+            Content that wasn't captured in Q&A pairs
+        """
+        remaining_text = text
+        
+        # Remove Q&A content from the text
+        for question, answer in qa_pairs:
+            # Try to find and remove the Q&A pattern
+            qa_markers = self.get_qa_markers(language)
+            
+            for q_marker, a_marker in qa_markers:
+                for separator in [':', '.', ' ']:
+                    q_pattern = f"{q_marker}{separator}"
+                    a_pattern = f"{a_marker}{separator}"
+                    
+                    # Pattern to match the full Q&A
+                    full_qa_pattern = rf'\s*{re.escape(q_pattern)}\s*{re.escape(question)}\s*{re.escape(a_pattern)}\s*{re.escape(answer)}'
+                    remaining_text = re.sub(full_qa_pattern, '', remaining_text, flags=re.IGNORECASE | re.DOTALL)
+            
+            # Also try to remove just the question and answer separately
+            remaining_text = remaining_text.replace(question, '')
+            remaining_text = remaining_text.replace(answer, '')
+        
+        # Clean up extra whitespace
+        remaining_text = re.sub(r'\n\s*\n\s*\n', '\n\n', remaining_text)
+        return remaining_text.strip()
+
+    def _process_policy_section(self, section_content: str, section_title: str, language: str, section_idx: int) -> List[Chunk]:
+        """
+        Process policy sections ensuring all clauses and content are preserved.
+        
+        Args:
+            section_content: Content of the policy section
+            section_title: Title of the section
+            language: Language code
+            section_idx: Index of the section
+            
+        Returns:
+            List of policy chunks preserving all data
+        """
+        chunks = []
+        
+        # Look for numbered clauses
+        script_group = self.get_script_group(language)
+        clauses = self._extract_policy_clauses(section_content, script_group)
+        
+        if clauses:
+            # Process clauses in groups while preserving all content
+            current_clauses = []
+            current_size = 0
+            max_size = 400  # Max words per chunk for policies (longer than regular content)
+            
+            for clause_idx, clause in enumerate(clauses):
+                clause_size = len(clause) if script_group == 'cjk' else len(clause.split())
+                
+                # Create individual clause chunks for precise search
+                clause_chunk = Chunk(
+                    text=clause,
+                    section=section_title,
+                    type="policy_clause",
+                    metadata=ChunkMetadata(
+                        hasQuestion=False,
+                        documentType='policy',
+                        language=language,
+                        chunkIndex=len(chunks),
+                        totalChunks=0,
+                        sectionIndex=section_idx,
+                        clauseIndex=clause_idx
+                    )
+                )
+                chunks.append(clause_chunk)
+                
+                # Group clauses for context-aware chunks
+                if current_size + clause_size > max_size and current_clauses:
+                    # Save current grouped chunk
+                    chunk_text = "\n\n".join(current_clauses)
+                    grouped_chunk = Chunk(
+                        text=chunk_text,
+                        section=section_title,
+                        type="policy_clauses_group",
+                        metadata=ChunkMetadata(
+                            hasQuestion=False,
+                            documentType='policy',
+                            language=language,
+                            chunkIndex=len(chunks),
+                            totalChunks=0,
+                            sectionIndex=section_idx
+                        )
+                    )
+                    chunks.append(grouped_chunk)
+                    current_clauses = [clause]
+                    current_size = clause_size
+                else:
+                    current_clauses.append(clause)
+                    current_size += clause_size
+            
+            # Add remaining grouped clauses
+            if current_clauses:
+                chunk_text = "\n\n".join(current_clauses)
+                grouped_chunk = Chunk(
+                    text=chunk_text,
+                    section=section_title,
+                    type="policy_clauses_group",
+                    metadata=ChunkMetadata(
+                        hasQuestion=False,
+                        documentType='policy',
+                        language=language,
+                        chunkIndex=len(chunks),
+                        totalChunks=0,
+                        sectionIndex=section_idx
+                    )
+                )
+                chunks.append(grouped_chunk)
+            
+            # Extract any content that wasn't captured in clauses
+            remaining_content = self._extract_non_clause_content(section_content, clauses)
+            if remaining_content.strip():
+                remaining_chunks = self.chunk_text_preserving_data(remaining_content, language, section_title, section_idx)
+                chunks.extend(remaining_chunks)
+        else:
+            # No specific clauses found, process as regular content
+            content_chunks = self.chunk_text_preserving_data(section_content, language, section_title, section_idx)
+            chunks.extend(content_chunks)
+        
+        return chunks
+
+    def _extract_policy_clauses(self, text: str, script_group: str) -> List[str]:
+        """Extract numbered policy clauses based on script group."""
+        clauses = []
+        
+        if script_group == 'cjk':
+            clause_pattern = r'(?:^|\n)\s*(?:\d+|[一二三四五六七八九十]+)[\.．、]\s*(.*?)(?=\n\s*(?:\d+|[一二三四五六七八九十]+)[\.．、]|\Z)'
+        elif script_group in ['devanagari', 'bengali', 'dravidian', 'gurmukhi', 'gujarati']:
+            clause_pattern = r'(?:^|\n)\s*(?:\d+|[१२३४५६७८९०]+)[\.।]\s*(.*?)(?=\n\s*(?:\d+|[१२३४५६७८९०]+)[\.।]|\Z)'
+        elif script_group == 'arabic':
+            clause_pattern = r'(?:^|\n)\s*(?:\d+|[١٢٣٤٥٦٧٨٩٠]+)[\.،]\s*(.*?)(?=\n\s*(?:\d+|[١٢٣٤٥٦٧٨٩٠]+)[\.،]|\Z)'
+        else:
+            clause_pattern = r'(?:^|\n)\s*\d+\.\s*(.*?)(?=\n\s*\d+\.|\Z)'
+        
+        for match in re.finditer(clause_pattern, text, re.DOTALL):
+            clause = match.group(1).strip()
+            if clause:
+                clauses.append(clause)
+        
+        return clauses
+
+    def _extract_non_clause_content(self, text: str, clauses: List[str]) -> str:
+        """Extract content that wasn't captured in policy clauses."""
+        remaining_text = text
+        
+        # Remove clause content
+        for clause in clauses:
+            remaining_text = remaining_text.replace(clause, '')
+        
+        # Remove clause numbering patterns
+        patterns = [
+            r'(?:^|\n)\s*\d+\.\s*',
+            r'(?:^|\n)\s*[一二三四五六七八九十]+[\.．、]\s*',
+            r'(?:^|\n)\s*[१२३४५६७८९०]+[\.।]\s*',
+            r'(?:^|\n)\s*[١٢٣٤٥٦٧٨٩٠]+[\.،]\s*'
+        ]
+        
+        for pattern in patterns:
+            remaining_text = re.sub(pattern, '\n', remaining_text, flags=re.MULTILINE)
+        
+        # Clean up extra whitespace
+        remaining_text = re.sub(r'\n\s*\n\s*\n', '\n\n', remaining_text)
+        return remaining_text.strip()
+
+    def chunk_text_preserving_data(self, text: str, language: str, section_title: str, section_idx: int, max_chunk_size: int = 300, overlap_percentage: float = 0.15) -> List[Chunk]:
+        """
+        Split text into chunks while ensuring ALL data is preserved through overlapping and complete coverage.
+        
+        Args:
+            text: Text to chunk
+            language: Language code
+            section_title: Title of the section this text belongs to
+            section_idx: Index of the section
+            max_chunk_size: Maximum words per chunk
+            overlap_percentage: Percentage of chunk to overlap with next chunk
+            
+        Returns:
+            List of Chunk objects ensuring no data loss
+        """
+        if not text.strip():
+            return []
+        
+        # Split text into paragraphs first
+        paragraphs = re.split(r'\n\s*\n', text)
+        paragraphs = [p.strip() for p in paragraphs if p.strip()]
+        
+        if not paragraphs:
+            return []
+        
+        # For CJK languages, count characters instead of words
+        script_group = self.get_script_group(language)
+        count_chars = script_group == 'cjk' or script_group == 'thai'
+        
+        chunks = []
+        current_chunk_paragraphs = []
+        current_size = 0
+        
+        for para_idx, paragraph in enumerate(paragraphs):
+            # Determine paragraph size
+            paragraph_size = len(paragraph) if count_chars else len(paragraph.split())
+            
+            # If this single paragraph is larger than max size, split it into sentences
+            if paragraph_size > max_chunk_size:
+                # Save current chunk if we have one
+                if current_chunk_paragraphs:
+                    chunk_text = "\n\n".join(current_chunk_paragraphs)
+                    chunk = Chunk(
+                        text=chunk_text,
+                        section=section_title,
+                        type="content",
+                        metadata=ChunkMetadata(
+                            hasQuestion=False,
+                            documentType='general',
+                            language=language,
+                            chunkIndex=len(chunks),
+                            totalChunks=0,
+                            sectionIndex=section_idx
+                        )
+                    )
+                    chunks.append(chunk)
+                    current_chunk_paragraphs = []
+                    current_size = 0
+                
+                # Split large paragraph into sentence-based chunks
+                sentence_chunks = self._create_sentence_chunks(paragraph, language, section_title, section_idx, max_chunk_size, overlap_percentage)
+                chunks.extend(sentence_chunks)
+                
+            # If adding this paragraph would exceed chunk size, finalize current chunk
+            elif current_size > 0 and current_size + paragraph_size > max_chunk_size:
+                chunk_text = "\n\n".join(current_chunk_paragraphs)
+                chunk = Chunk(
+                    text=chunk_text,
+                    section=section_title,
+                    type="content",
+                    metadata=ChunkMetadata(
+                        hasQuestion=False,
+                        documentType='general',
+                        language=language,
+                        chunkIndex=len(chunks),
+                        totalChunks=0,
+                        sectionIndex=section_idx
+                    )
+                )
+                chunks.append(chunk)
+                current_chunk_paragraphs = [paragraph]
+                current_size = paragraph_size
+            else:
+                # Add paragraph to current chunk
+                current_chunk_paragraphs.append(paragraph)
+                current_size += paragraph_size
+        
+        # Add any remaining paragraphs
+        if current_chunk_paragraphs:
+            chunk_text = "\n\n".join(current_chunk_paragraphs)
+            chunk = Chunk(
+                text=chunk_text,
+                section=section_title,
+                type="content",
+                metadata=ChunkMetadata(
+                    hasQuestion=False,
+                    documentType='general',
+                    language=language,
+                    chunkIndex=len(chunks),
+                    totalChunks=0,
+                    sectionIndex=section_idx
+                )
+            )
+            chunks.append(chunk)
+        
+        # Apply overlap between chunks to ensure context preservation
+        if len(chunks) > 1 and overlap_percentage > 0:
+            chunks = self._apply_chunk_overlap_to_chunks(chunks, overlap_percentage, count_chars)
+        
+        return chunks
+
+    def _create_sentence_chunks(self, paragraph: str, language: str, section_title: str, section_idx: int, max_chunk_size: int, overlap_percentage: float) -> List[Chunk]:
+        """Create chunks from a large paragraph by splitting into sentences."""
+        sentences = self.split_into_sentences(paragraph, language)
+        
+        script_group = self.get_script_group(language)
+        count_chars = script_group == 'cjk' or script_group == 'thai'
+        
+        chunks = []
+        current_sentences = []
+        current_size = 0
+        
+        for sentence in sentences:
+            sentence = sentence.strip()
+            if not sentence:
+                continue
+            
+            sentence_size = len(sentence) if count_chars else len(sentence.split())
+            
+            # If single sentence is too large, include it anyway to preserve data
+            if sentence_size > max_chunk_size:
+                # Save current sentences if any
+                if current_sentences:
+                    chunk_text = " ".join(current_sentences)
+                    chunk = Chunk(
+                        text=chunk_text,
+                        section=section_title,
+                        type="content",
+                        metadata=ChunkMetadata(
+                            hasQuestion=False,
+                            documentType='general',
+                            language=language,
+                            chunkIndex=len(chunks),
+                            totalChunks=0,
+                            sectionIndex=section_idx
+                        )
+                    )
+                    chunks.append(chunk)
+                    current_sentences = []
+                    current_size = 0
+                
+                # Add large sentence as its own chunk
+                chunk = Chunk(
+                    text=sentence,
+                    section=section_title,
+                    type="content",
+                    metadata=ChunkMetadata(
+                        hasQuestion=False,
+                        documentType='general',
+                        language=language,
+                        chunkIndex=len(chunks),
+                        totalChunks=0,
+                        sectionIndex=section_idx
+                    )
+                )
+                chunks.append(chunk)
+                
+            # If adding this sentence would exceed chunk size, finalize current chunk
+            elif current_size > 0 and current_size + sentence_size > max_chunk_size:
+                chunk_text = " ".join(current_sentences)
+                chunk = Chunk(
+                    text=chunk_text,
+                    section=section_title,
+                    type="content",
+                    metadata=ChunkMetadata(
+                        hasQuestion=False,
+                        documentType='general',
+                        language=language,
+                        chunkIndex=len(chunks),
+                        totalChunks=0,
+                        sectionIndex=section_idx
+                    )
+                )
+                chunks.append(chunk)
+                current_sentences = [sentence]
+                current_size = sentence_size
+            else:
+                current_sentences.append(sentence)
+                current_size += sentence_size
+        
+        # Add remaining sentences
+        if current_sentences:
+            chunk_text = " ".join(current_sentences)
+            chunk = Chunk(
+                text=chunk_text,
+                section=section_title,
+                type="content",
+                metadata=ChunkMetadata(
+                    hasQuestion=False,
+                    documentType='general',
+                    language=language,
+                    chunkIndex=len(chunks),
+                    totalChunks=0,
+                    sectionIndex=section_idx
+                )
+            )
+            chunks.append(chunk)
+        
+        return chunks
+
+    def _apply_chunk_overlap_to_chunks(self, chunks: List[Chunk], overlap_percentage: float, count_chars: bool) -> List[Chunk]:
+        """Apply overlap between consecutive chunks to preserve context."""
+        if len(chunks) <= 1:
+            return chunks
+        
+        overlapped_chunks = []
+        
+        for i, chunk in enumerate(chunks):
+            current_text = chunk.text
+            
+            # Add overlap from previous chunk (except for first chunk)
+            if i > 0:
+                prev_chunk = chunks[i - 1]
+                overlap_size = int(len(prev_chunk.text) * overlap_percentage) if count_chars else int(len(prev_chunk.text.split()) * overlap_percentage)
+                
+                if count_chars:
+                    # For character-based languages, take last N characters
+                    prev_overlap = prev_chunk.text[-overlap_size:] if overlap_size > 0 else ""
+                else:
+                    # For word-based languages, take last N words
+                    prev_words = prev_chunk.text.split()
+                    prev_overlap = " ".join(prev_words[-overlap_size:]) if overlap_size > 0 else ""
+                
+                if prev_overlap.strip():
+                    current_text = prev_overlap + " " + current_text
+            
+            # Create new chunk with overlapped content
+            overlapped_chunk = Chunk(
+                text=current_text,
+                section=chunk.section,
+                type=chunk.type + "_overlapped",
+                metadata=ChunkMetadata(
+                    hasQuestion=chunk.metadata.hasQuestion,
+                    documentType=chunk.metadata.documentType,
+                    language=chunk.metadata.language,
+                    chunkIndex=chunk.metadata.chunkIndex,
+                    totalChunks=chunk.metadata.totalChunks,
+                    sectionIndex=chunk.metadata.sectionIndex,
+                    hasOverlap=True
+                )
+            )
+            overlapped_chunks.append(overlapped_chunk)
+        
+        return overlapped_chunks
 
     def chunk_text(self, text: str, language: str, max_chunk_size: int = 300, overlap_percentage: float = 0.15) -> List[str]:
         """
@@ -1260,50 +1679,33 @@ class MultilingualMessageProcessor:
             overlapped_chunks.append(current_chunk)
         
         return overlapped_chunks
-    
-    def _extract_keywords(self, text: str, language: str, max_keywords: int = 5) -> List[str]:
-        """Extract key terms from chunk text for better matching"""
-        import re
-        from collections import Counter
-        
-        # Simple keyword extraction based on frequency and length
-        # Remove common stop words and extract meaningful terms
-        
-        # Basic cleanup
-        cleaned_text = re.sub(r'[^\w\s]', ' ', text.lower())
-        words = cleaned_text.split()
-        
-        # Filter words (length > 3, not purely numeric)
-        meaningful_words = [
-            word for word in words 
-            if len(word) > 3 and not word.isdigit() and word.isalpha()
-        ]
-        
-        # Count frequency and take top terms
-        word_freq = Counter(meaningful_words)
-        keywords = [word for word, freq in word_freq.most_common(max_keywords)]
-        
-        return keywords
-
-    def _create_context_summary(self, chunk_text: str, section: str, language: str) -> str:
-        """Create a brief context summary for the chunk"""
-        # Simple context summary - can be enhanced with LLM if needed
-        first_sentence = chunk_text.split('.')[0][:100] + "..." if len(chunk_text) > 100 else chunk_text
-        return f"From {section}: {first_sentence}"
-
 
 
     async def _setup_elasticsearch_indices(self):
-        """Setup Elasticsearch indices with proper mappings for vector search"""
- 
-        # Chunks index with vector field
+        """Setup Elasticsearch indices with proper mappings for vector search and simplified dynamic keywords"""
+
+        # Chunks index with vector field and essential keyword fields
         chunks_index = self.es_config['tenant_document_index_name']
         exists = await self.es_client.indices.exists(index=chunks_index)
         if not exists:
             await self.es_client.indices.create(
                 index=chunks_index,
+                settings={
+                    "number_of_shards": 1,
+                    "number_of_replicas": 1,
+                    "analysis": {
+                        "analyzer": {
+                            "keyword_analyzer": {
+                                "type": "custom",
+                                "tokenizer": "keyword",
+                                "filter": ["lowercase", "trim"]
+                            }
+                        }
+                    }
+                },
                 mappings={
                     "properties": {
+                        # Core content fields
                         "content": {"type": "text"},
                         "contentVector": {
                             "type": "dense_vector",
@@ -1311,28 +1713,475 @@ class MultilingualMessageProcessor:
                             "index": True,
                             "similarity": "cosine"
                         },
+                        
+                        # Identification fields
                         "tenantId": {"type": "keyword"},
                         "documentId": {"type": "keyword"},
                         "chunkType": {"type": "keyword"},
                         "sectionTitle": {"type": "text"},
                         "metadata": {"type": "object", "enabled": True},
+                        
+                        # Structure and context
                         "chunkPosition": {"type": "integer"},
                         "totalChunks": {"type": "integer"},
                         "hasOverlap": {"type": "boolean"},
-                        "keywords": {"type": "keyword"},
-                        "contextSummary": {"type": "text"}
+                        "contextSummary": {"type": "text"},
+                        
+                        # Simplified dynamic keywords (extracted by Mistral)
+                        "keywords": {
+                            "type": "keyword",
+                            "ignore_above": 100
+                        },
+                        "keywordsText": {
+                            "type": "text",
+                            "analyzer": "keyword_analyzer"
+                        },
+                        
+                        # Essential metadata
+                        "language": {"type": "keyword"},
+                        "keywordCount": {"type": "integer"}
                     }
                 }
             )
-            logger.info(f"Created chunks index: {chunks_index}")
+            logger.info(f"Created simplified chunks index: {chunks_index}")
+        else:
+            # Check if index needs updating for new fields
+            try:
+                current_mapping = await self.es_client.indices.get_mapping(index=chunks_index)
+                current_properties = current_mapping[chunks_index]['mappings'].get('properties', {})
+                
+                # Essential new fields only
+                new_fields = {
+                    "keywords": {
+                        "type": "keyword",
+                        "ignore_above": 100
+                    },
+                    "keywordsText": {
+                        "type": "text",
+                        "analyzer": "keyword_analyzer"
+                    },
+                    "language": {"type": "keyword"},
+                    "keywordCount": {"type": "integer"}
+                }
+                
+                # Add missing fields if any
+                fields_to_add = {}
+                for field_name, field_mapping in new_fields.items():
+                    if field_name not in current_properties:
+                        fields_to_add[field_name] = field_mapping
+                
+                if fields_to_add:
+                    logger.info(f"Adding {len(fields_to_add)} new fields to existing index")
+                    await self.es_client.indices.put_mapping(
+                        index=chunks_index,
+                        properties=fields_to_add
+                    )
+                    logger.info(f"Successfully added new fields: {list(fields_to_add.keys())}")
+                    
+            except Exception as e:
+                logger.warning(f"Could not update index mapping: {str(e)}")
 
-    async def process_document_message(self, message: Dict[str, Any]):
+    async def extract_keywords_and_context_with_mistral(self, text: str, section_title: str = "", language: str = 'en', max_keywords: int = 20) -> Dict[str, Any]:
         """
-        Process an individual message and store it in Elasticsearch with vector embeddings.
-        Enhanced with context preservation features.
+        Extract keywords and context summary dynamically using Mistral for any language and domain
         
         Args:
-            message: Message dictionary containing content and metadata.
+            text: The chunk text to extract keywords and context from
+            section_title: The section title for additional context
+            language: Language code for the text
+            max_keywords: Maximum number of keywords to extract
+            
+        Returns:
+            Dictionary containing keywords, context summary, and metadata
+        """
+        try:
+            # Enhanced system prompt for both keyword extraction and context generation
+            system_prompt = f"""Extract {max_keywords} keywords and create a context summary from the text. Return ONLY JSON:
+    {{
+        "keywords": ["word1", "phrase1", "concept1"],
+        "context_summary": "Brief 1-2 sentence summary of the main content and purpose"
+    }}
+
+    Rules for keywords:
+    - Same language as input text
+    - Important nouns, technical terms, key phrases
+    - No stop words or articles
+    - Max 3 words per phrase
+    - Focus on searchable terms
+
+    Rules for context_summary:
+    - 1-2 sentences maximum
+    - Capture main purpose/content
+    - Same language as input
+    - Clear and concise"""
+
+            # Enhanced user prompt with section context
+            section_context = f"Section: {section_title}\n\n" if section_title and section_title != "General" else ""
+            user_prompt = f"{section_context}Text: {text[:1200]}"
+
+            # Prepare payload for Mistral
+            data = {
+                "model": MISTRAL_CONFIG['model'],
+                "messages": [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt}
+                ],
+                "stream": False,
+                "max_tokens": 250,
+                "temperature": 0.1
+            }
+
+            logger.info(f"Extracting keywords and context for chunk in language: {language}, data: {data}")
+            
+            response = await self.http_client.post(
+                MISTRAL_CONFIG['chat_url'],
+                headers={"Content-Type": "application/json"},
+                json=data,
+                timeout=MISTRAL_CONFIG['timeout']
+            )
+            
+            logger.info(f"Mistral API response status: {response.status_code}")
+            
+            if response.status_code != 200:
+                logger.error(f"Mistral extraction error: {response.status_code} - {response.text}")
+                return self._fallback_extraction(text, section_title, language, max_keywords)
+
+            response_data = response.json()
+            
+            logger.info(f"Mistral response received for keyword and context extraction, response_data: {response_data}")
+
+            if 'choices' in response_data and len(response_data['choices']) > 0:
+                content = response_data['choices'][0]['message']['content'].strip()
+                logger.info(f"Extracted content from Mistral: {content}")
+                
+                try:
+                    # Parse JSON response
+                    extraction_data = json.loads(content)
+                    logger.info(f"Successfully parsed JSON: {extraction_data}")
+                    
+                    # Validate and process the response
+                    processed_data = self._process_mistral_extraction(extraction_data, text, section_title, max_keywords)
+                    
+                    logger.info(f"Successfully extracted {len(processed_data.get('keywords', []))} keywords and context")
+                    return processed_data
+                    
+                except json.JSONDecodeError as e:
+                    logger.error(f"Failed to parse Mistral JSON response: {e}")
+                    logger.error(f"Raw response: {content}")
+                    return self._extract_from_text_response(content, text, section_title, max_keywords)
+            
+            logger.error("No choices in response or empty choices")
+            return self._fallback_extraction(text, section_title, language, max_keywords)
+            
+        except Exception as e:
+            logger.error(f"Error in Mistral keyword and context extraction: {type(e).__name__}: {str(e)}")
+            import traceback
+            logger.error(f"Full traceback: {traceback.format_exc()}")
+            return self._fallback_extraction(text, section_title, language, max_keywords)
+    
+    def _process_mistral_extraction(self, extraction_data: Dict, text: str, section_title: str, max_keywords: int) -> Dict[str, Any]:
+        """
+        Process and validate Mistral extraction response
+        
+        Args:
+            extraction_data: Raw data from Mistral
+            text: Original text for fallback
+            section_title: Section title
+            max_keywords: Maximum keywords
+            
+        Returns:
+            Processed extraction data
+        """
+        processed = {
+            "keywords": [],
+            "context_summary": "",
+            "content_type": "general",
+            "key_topics": [],
+            "extraction_method": "mistral"
+        }
+        
+        # Process keywords
+        if 'keywords' in extraction_data and isinstance(extraction_data['keywords'], list):
+            # Clean and validate keywords
+            keywords = []
+            for keyword in extraction_data['keywords'][:max_keywords]:
+                if isinstance(keyword, str) and len(keyword.strip()) > 1:
+                    cleaned = keyword.strip().lower()
+                    # Remove common stop words and very short words
+                    if len(cleaned) > 2 and cleaned not in ['the', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for', 'of', 'with', 'by']:
+                        keywords.append(keyword.strip())
+            processed["keywords"] = keywords
+        
+        # Process context summary
+        if 'context_summary' in extraction_data and isinstance(extraction_data['context_summary'], str):
+            summary = extraction_data['context_summary'].strip()
+            if len(summary) > 10:  # Ensure it's not too short
+                processed["context_summary"] = summary
+            else:
+                processed["context_summary"] = self._create_fallback_summary(text, section_title)
+        else:
+            processed["context_summary"] = self._create_fallback_summary(text, section_title)
+        
+        # Process content type
+        if 'content_type' in extraction_data and isinstance(extraction_data['content_type'], str):
+            content_type = extraction_data['content_type'].strip()
+            if len(content_type) > 0:  # Accept any non-empty content type
+                processed["content_type"] = content_type
+        
+        # Process key topics
+        if 'key_topics' in extraction_data and isinstance(extraction_data['key_topics'], list):
+            topics = [topic.strip() for topic in extraction_data['key_topics'][:5] if isinstance(topic, str) and len(topic.strip()) > 2]
+            processed["key_topics"] = topics
+        
+        # Process detected language
+        # Language is already known, no need to detect again
+        
+        return processed
+
+    def _extract_from_text_response(self, content: str, text: str, section_title: str, max_keywords: int) -> Dict[str, Any]:
+        """
+        Extract information from non-JSON Mistral response
+        
+        Args:
+            content: Raw text response from Mistral
+            text: Original text
+            section_title: Section title
+            max_keywords: Maximum keywords
+            
+        Returns:
+            Extracted data
+        """
+        logger.info("Attempting to parse non-JSON Mistral response")
+        
+        extracted = {
+            "keywords": [],
+            "context_summary": "",
+            "content_type": "general",
+            "key_topics": [],
+            "extraction_method": "text_parsing"
+        }
+        
+        lines = content.split('\n')
+        current_section = None
+        
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+                
+            # Look for keywords section
+            if 'keyword' in line.lower() and ':' in line:
+                current_section = 'keywords'
+                # Try to extract keywords from the same line
+                if line.count(':') == 1:
+                    keywords_part = line.split(':', 1)[1].strip()
+                    if keywords_part:
+                        extracted["keywords"].extend(self._parse_keywords_from_text(keywords_part))
+            
+            # Look for context/summary section
+            elif any(term in line.lower() for term in ['context', 'summary', 'purpose']) and ':' in line:
+                current_section = 'context'
+                if line.count(':') == 1:
+                    context_part = line.split(':', 1)[1].strip()
+                    if context_part and len(context_part) > 10:
+                        extracted["context_summary"] = context_part
+            
+            # Look for content type
+            elif 'type' in line.lower() and ':' in line:
+                if line.count(':') == 1:
+                    type_part = line.split(':', 1)[1].strip()
+                    if len(type_part) > 0:  # Accept any non-empty content type
+                        extracted["content_type"] = type_part
+            
+            # Continue parsing based on current section
+            elif current_section == 'keywords' and line:
+                extracted["keywords"].extend(self._parse_keywords_from_text(line))
+            elif current_section == 'context' and line and len(line) > 10:
+                if not extracted["context_summary"]:
+                    extracted["context_summary"] = line
+        
+        # Clean up keywords
+        extracted["keywords"] = list(dict.fromkeys(extracted["keywords"][:max_keywords]))  # Remove duplicates
+        
+        # Fallback for missing context
+        if not extracted["context_summary"]:
+            extracted["context_summary"] = self._create_fallback_summary(text, section_title)
+        
+        return extracted
+
+    def _parse_keywords_from_text(self, text: str) -> List[str]:
+        """Parse keywords from text line"""
+        keywords = []
+        
+        # Remove common formatting
+        text = text.replace('[', '').replace(']', '').replace('"', '').replace("'", '')
+        
+        # Split by common separators
+        for separator in [',', ';', '|', '\n']:
+            if separator in text:
+                parts = text.split(separator)
+                for part in parts:
+                    keyword = part.strip()
+                    if len(keyword) > 2 and keyword.lower() not in ['and', 'or', 'the', 'a', 'an']:
+                        keywords.append(keyword)
+                break
+        else:
+            # No separator found, try to extract words
+            words = text.split()
+            for word in words:
+                word = word.strip('.,;:!?')
+                if len(word) > 2:
+                    keywords.append(word)
+        
+        return keywords
+
+    def _create_fallback_summary(self, text: str, section_title: str) -> str:
+        """Create a simple fallback summary"""
+        # Use first sentence or first 100 characters
+        sentences = text.split('.')
+        if sentences and len(sentences[0].strip()) > 10:
+            summary = sentences[0].strip() + '.'
+        else:
+            summary = text[:100].strip() + '...'
+        
+        # Add section context if available
+        if section_title and section_title != "General":
+            summary = f"Content from {section_title}: {summary}"
+        
+        return summary
+
+    def _fallback_extraction(self, text: str, section_title: str, language: str, max_keywords: int) -> Dict[str, Any]:
+        """
+        Fallback extraction when Mistral fails
+        
+        Args:
+            text: Text to process
+            section_title: Section title
+            language: Language code
+            max_keywords: Maximum keywords
+            
+        Returns:
+            Basic extraction data
+        """
+        logger.info("Using fallback extraction method")
+        
+        # Simple keyword extraction
+        words = text.lower().split()
+        word_freq = {}
+        
+        for word in words:
+            word = word.strip('.,;:!?()[]{}')
+            if len(word) > 3 and word not in ['the', 'and', 'or', 'but', 'with', 'from', 'this', 'that', 'they', 'have', 'been', 'were']:
+                word_freq[word] = word_freq.get(word, 0) + 1
+        
+        # Get most frequent words as keywords
+        keywords = sorted(word_freq.items(), key=lambda x: x[1], reverse=True)[:max_keywords]
+        keyword_list = [word for word, freq in keywords]
+        
+        # Create basic summary
+        summary = self._create_fallback_summary(text, section_title)
+        
+        return {
+            "keywords": keyword_list,
+            "context_summary": summary,
+            "content_type": "general",
+            "key_topics": keyword_list[:3],
+            "extraction_method": "fallback"
+        }
+        
+    def _validate_and_clean_keywords(self, keywords_data: Dict, max_keywords: int) -> Dict[str, List[str]]:
+        """Validate and clean the keywords extracted by Mistral"""
+        
+        default_structure = {
+            "primary_keywords": [],
+            "key_phrases": [],
+            "domain_concepts": [],
+            "action_words": [],
+            "semantic_variations": []
+        }
+        
+        # Ensure all required keys exist
+        for key in default_structure:
+            if key not in keywords_data:
+                keywords_data[key] = []
+        
+        # Clean and validate each category
+        cleaned = {}
+        total_keywords = 0
+        
+        for category, keywords in keywords_data.items():
+            if category in default_structure:
+                # Clean keywords
+                clean_keywords = []
+                for keyword in keywords:
+                    if isinstance(keyword, str):
+                        keyword = keyword.strip().lower()
+                        # Basic validation
+                        if (len(keyword) > 1 and 
+                            len(keyword) < 50 and 
+                            not keyword.isdigit() and
+                            total_keywords < max_keywords):
+                            clean_keywords.append(keyword)
+                            total_keywords += 1
+                
+                cleaned[category] = clean_keywords
+        
+        return cleaned
+
+    def _extract_from_text_response(self, content: str, max_keywords: int) -> Dict[str, List[str]]:
+        """Extract keywords from non-JSON text response"""
+        
+        # Try to find keyword lists in the response
+        keywords = []
+        
+        # Look for lines that contain keywords
+        lines = content.split('\n')
+        for line in lines:
+            line = line.strip()
+            if line and not line.startswith('{') and not line.startswith('}'):
+                # Remove bullets, numbers, and other prefixes
+                cleaned_line = re.sub(r'^[-*•\d\.\)\]]\s*', '', line)
+                if len(cleaned_line) > 1 and len(cleaned_line) < 50:
+                    keywords.append(cleaned_line.lower().strip())
+        
+        # Distribute keywords across categories
+        total = min(len(keywords), max_keywords)
+        return {
+            "primary_keywords": keywords[:total//2],
+            "key_phrases": keywords[total//2:total//2 + total//4],
+            "domain_concepts": keywords[total//2 + total//4:total//2 + total//2],
+            "action_words": keywords[total//2 + total//2:total],
+            "semantic_variations": []
+        }
+
+    def _fallback_keyword_extraction(self, text: str, language: str, max_keywords: int) -> Dict[str, List[str]]:
+        """Simple fallback keyword extraction when Mistral is not available"""
+        
+        # Basic text processing
+        words = re.findall(r'\b\w+\b', text.lower())
+        
+        # Simple frequency-based extraction
+        word_freq = {}
+        for word in words:
+            if len(word) > 3 and word.isalpha():
+                word_freq[word] = word_freq.get(word, 0) + 1
+        
+        # Get most frequent words
+        sorted_words = sorted(word_freq.items(), key=lambda x: (x[1], len(x[0])), reverse=True)
+        top_words = [word for word, freq in sorted_words[:max_keywords]]
+        
+        return {
+            "primary_keywords": top_words[:max_keywords//2],
+            "key_phrases": [],
+            "domain_concepts": top_words[max_keywords//2:],
+            "action_words": [],
+            "semantic_variations": []
+        }
+
+
+    async def process_document_message_simplified(self, message: Dict[str, Any]):
+        """
+        Simplified document processing with essential keyword extraction
         """
         # Extract text content from message
         content = message.get('content')
@@ -1353,28 +2202,51 @@ class MultilingualMessageProcessor:
         # Extract semantic chunks with language awareness
         chunks = self.extract_chunks(content, language)
         logger.info(f"Extracted {len(chunks)} semantic chunks from document")
-        
+        logger.info(f"chunks data: {(chunks)} ")
         # Process and index each chunk
         indexing_tasks = []
         for i, chunk in enumerate(chunks):
             # Generate vector embedding for the chunk
             vector = self.st_model.encode(chunk.text).tolist()
             
-            # Extract keywords for better matching
-            keywords = self._extract_keywords(chunk.text, language)
+            # Extract keywords using simplified Mistral approach
+            extracted_keywords = await self.extract_keywords_and_context_with_mistral(
+                chunk.text, chunk.section,
+                language, 
+                max_keywords=15
+            )
             
-            # Create context summary
-            context_summary = self._create_context_summary(chunk.text, chunk.section, language)
+            # Get the main keywords list (simplified structure)
+            if 'keywords' in extracted_keywords:
+                main_keywords = extracted_keywords['keywords']
+            else:
+                # Fallback: combine all categories
+                main_keywords = []
+                for keyword_list in extracted_keywords.values():
+                    if isinstance(keyword_list, list):
+                        main_keywords.extend(keyword_list)
             
-            # Add any additional metadata from the message
+            # Remove duplicates
+            unique_keywords = list(dict.fromkeys(main_keywords))
+            
+            # Create searchable keywords text
+            keywords_text = ' '.join(unique_keywords)
+            
+            if 'context_summary' in extracted_keywords:
+                context_summary = extracted_keywords['context_summary']
+            else:
+                # Create context summary
+                context_summary = self._create_context_summary(chunk.text, chunk.section, unique_keywords[:3])
+            
+            # Add metadata
             combined_metadata = {**metadata}
             combined_metadata.update(chunk.metadata.model_dump())
             combined_metadata['chunkIndex'] = i
             combined_metadata['totalChunks'] = len(chunks)
-            combined_metadata['keywords'] = keywords
-            combined_metadata['hasOverlap'] = i > 0  # All chunks except first have overlap
+            combined_metadata['hasOverlap'] = i > 0
+            combined_metadata['language'] = language
             
-            # Prepare chunk document with enhanced fields
+            # Simplified chunk document
             chunk_doc = {
                 'content': chunk.text,
                 'contentVector': vector,
@@ -1383,12 +2255,18 @@ class MultilingualMessageProcessor:
                 'chunkType': chunk.type,
                 'sectionTitle': chunk.section,
                 'metadata': combined_metadata,
-                # New context preservation fields
+                
+                # Structure
                 'chunkPosition': i,
                 'totalChunks': len(chunks),
                 'hasOverlap': i > 0,
-                'keywords': keywords,
-                'contextSummary': context_summary
+                'contextSummary': context_summary,
+                
+                # Simplified keywords
+                'keywords': unique_keywords,
+                'keywordsText': keywords_text,
+                'language': language,
+                'keywordCount': len(unique_keywords)
             }
             
             # Index the chunk
@@ -1404,39 +2282,31 @@ class MultilingualMessageProcessor:
         # Wait for all indexing tasks to complete
         await asyncio.gather(*indexing_tasks)
         
-        # Delete old inactive documents for this tenant
-        delete_query = {
-            "query": {
-                "bool": {
-                    "must": [
-                        {"term": {"tenantId": tenant_id}},
-                        {"term": {"metadata.inactive": True}}
-                    ]
-                }
-            }
-        }
-        
-        # Delete from index
-        await self.es_client.delete_by_query(
-            index=self.es_config['tenant_document_index_name'], 
-            body=delete_query
-        )
-
-        logger.info(f"Deleted old inactive documents for tenant_id: {tenant_id}")
-        
-        # Send success response
+        processed_doc_ids = set()        
+        processed_doc_ids.add(document_id)
         await self.publish_kafka_message(
             self.response_topic,
             tenant_id,
             DataStorageDto(
                 tenantId=tenant_id,
-                storedIds= list({document_id}),
-                isDone= True,
-                dataType='doc'
+                storedIds=list(processed_doc_ids),
+                isDone=True,
+                dataType ='doc'
             )
         )
+
+        # Continue with existing cleanup and response logic...
+        logger.info(f"Successfully indexed {len(chunks)} chunks with simplified keywords for document {document_id}")
+
+    def _create_context_summary(self, chunk_text: str, section: str, top_keywords: List[str]) -> str:
+        """Create a simple context summary"""
+        first_sentence = chunk_text.split('.')[0][:150]
+        keywords_str = ', '.join(top_keywords) if top_keywords else ''
         
-        logger.info(f"Successfully indexed all {len(chunks)} chunks for document {document_id}")
+        if keywords_str:
+            return f"From {section}: {first_sentence}... [Keywords: {keywords_str}]"
+        else:
+            return f"From {section}: {first_sentence}..."
 
 
     async def process_faq_message(self, message: Dict[str, Any]):
@@ -1604,15 +2474,19 @@ class MultilingualMessageProcessor:
             else:
                 future.set_result(msg)
         
-        # Get current trackingId
+        # Get current trackingId and ensure it's a string
         tracking_id = tracking_id_var.get() or "NA"
+        if isinstance(tracking_id, bytes):
+            tracking_id_str = tracking_id.decode("utf-8")
+        else:
+            tracking_id_str = str(tracking_id)
 
         self.producer.produce(
             topic,
             key=serialized_key,
             value=serialized_value,
             callback=delivery_callback,
-            headers=[("trackingId", tracking_id.encode("utf-8"))]
+            headers=[("X-Tracking-ID", tracking_id_str)]
         )
         self.producer.poll(1)  # Trigger delivery callbacks
         self.producer.flush()
@@ -1812,14 +2686,14 @@ class MultilingualMessageProcessor:
                         
                         # --- Set the tracking ID from Kafka headers before logging ---
                         kafka_headers = dict(msg.headers() or [])
-                        tracking_id = kafka_headers.get('trackingId', 'NA')
-                        tracking_id_var.set(tracking_id)
+                        tracking_id = kafka_headers.get('X-Tracking-ID', b'NA')
+                        tracking_id_var.set(tracking_id.decode('utf-8') if isinstance(tracking_id, bytes) else str(tracking_id))
 
                         # Process message
                         try:
                             value = self._parse_message(msg.value())
                             logger.info(f"📄 Processing document message (partition: {msg.partition()}, offset: {msg.offset()})")
-                            await self.process_document_message(value)
+                            await self.process_document_message_simplified(value)
                             logger.info("✓ Document message processed successfully")
                             
                         except Exception as e:
