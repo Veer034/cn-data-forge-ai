@@ -29,6 +29,6 @@ MISTRAL_CONFIG = {
     'chat_url': os.getenv('MISTRAL_CHAT_URL', 'http://localhost:11434/api/chat'),
     'version_url': os.getenv('MISTRAL_VERSION_URL', 'http://localhost:11434/api/version'),
     'model': os.getenv('MISTRAL_MODEL', 'mistral'),
-    'timeout': 120,
+    'timeout': 300,
 }
 
