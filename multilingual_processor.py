@@ -17,7 +17,7 @@ from contextvars import ContextVar
 
 # Import our utility modules
 from document_section_utils import DocumentSectionUtils
-from improved_chunking_utils import ImprovedChunkingUtils
+from chunking_utils import ImprovedChunkingUtils
 from config import KAFKA_CONFIG, ES_CONFIG, MISTRAL_CONFIG
 from libaryLanguage import LibraryLanguageDetector
 from logger_config import get_logger
