@@ -3,6 +3,7 @@ from typing import List, Dict, Any, Optional, Tuple
 from pydantic import BaseModel
 from language_constants import LanguageConstants
 from text_processing_utils import TextProcessingUtils
+from document_section_utils import DocumentSectionUtils
 
 class ChunkMetadata(BaseModel):
     hasQuestion: bool = False
@@ -30,7 +31,7 @@ class Chunk(BaseModel):
     metadata: ChunkMetadata
 
 class ImprovedChunkingUtils:
-    """Complete improved utilities for intelligent text chunking with section-based analysis"""
+    """Complete improved utilities for intelligent text chunking with multilingual support"""
     
     @staticmethod
     def extract_chunks_with_section_analysis(text: str, language: str, sections: List[Tuple[str, str]]) -> List[Chunk]:
@@ -165,244 +166,117 @@ class ImprovedChunkingUtils:
     @staticmethod
     def _process_section_intelligently(section_content: str, section_title: str, section_type: str, 
                                      overall_doc_type: str, language: str, section_idx: int) -> List[Chunk]:
-        """Process section intelligently based on its type"""
+        """Process section intelligently based on its type - REDUCED CHUNKING"""
         chunks = []
         
-        # Always create section-level chunk for context
-        section_chunk = Chunk(
-            text=f"Section: {section_title}\n\n{section_content}",
-            section=section_title,
-            type="section_overview",
-            metadata=ChunkMetadata(
-                hasQuestion=False,
-                documentType=overall_doc_type,
-                sectionType=section_type,
-                language=language,
-                chunkIndex=0,
-                totalChunks=0,
-                sectionIndex=section_idx,
-                contentScore=1.0
-            )
-        )
-        chunks.append(section_chunk)
-        
-        # Process based on section type
+        # Create ONE consolidated section chunk instead of multiple
         if section_type == 'faq':
-            faq_chunks = ImprovedChunkingUtils._process_faq_section_consolidated(
-                section_content, section_title, language, section_idx
-            )
-            chunks.extend(faq_chunks)
-            
-        elif section_type == 'policy':
-            policy_chunks = ImprovedChunkingUtils._process_policy_section_consolidated(
-                section_content, section_title, language, section_idx
-            )
-            chunks.extend(policy_chunks)
-            
-        else:
-            content_chunks = ImprovedChunkingUtils._create_consolidated_chunks(
-                section_content, section_title, section_type, language, section_idx
-            )
-            chunks.extend(content_chunks)
-        
-        return chunks
-
-    @staticmethod
-    def _process_faq_section_consolidated(section_content: str, section_title: str, language: str, section_idx: int) -> List[Chunk]:
-        """Process FAQ sections by consolidating related Q&As"""
-        chunks = []
-        
-        # Extract all Q&A pairs
-        qa_pairs = ImprovedChunkingUtils._extract_qa_pairs_improved(section_content, language)
-        
-        if qa_pairs:
-            # Group Q&As into consolidated chunks (6 Q&As per chunk)
-            chunk_size = 6
-            
-            for i in range(0, len(qa_pairs), chunk_size):
-                batch = qa_pairs[i:i + chunk_size]
-                
+            # Extract Q&A pairs and consolidate them
+            qa_pairs = ImprovedChunkingUtils._extract_qa_pairs_improved(section_content, language)
+            if qa_pairs:
+                # Create ONE FAQ chunk with all Q&As
                 consolidated_text = f"FAQ Section: {section_title}\n\n"
-                for j, (question, answer) in enumerate(batch):
-                    consolidated_text += f"Q{i+j+1}: {question}\nA{i+j+1}: {answer}\n\n"
+                for i, (question, answer) in enumerate(qa_pairs):
+                    consolidated_text += f"Q{i+1}: {question}\nA{i+1}: {answer}\n\n"
                 
                 faq_chunk = Chunk(
                     text=consolidated_text.strip(),
                     section=section_title,
-                    type="faq_consolidated",
+                    type="faq_section",
                     metadata=ChunkMetadata(
                         hasQuestion=True,
-                        documentType='faq',
+                        documentType=overall_doc_type,
                         sectionType='faq',
                         language=language,
                         qaFormat="consolidated",
-                        chunkIndex=len(chunks),
-                        totalChunks=0,
                         sectionIndex=section_idx,
-                        qaCount=len(batch),
+                        qaCount=len(qa_pairs),
                         contentScore=1.0
                     )
                 )
                 chunks.append(faq_chunk)
-        else:
-            # No Q&A pairs found, treat as regular content
-            content_chunks = ImprovedChunkingUtils._create_consolidated_chunks(
-                section_content, section_title, 'faq', language, section_idx
-            )
-            chunks.extend(content_chunks)
-        
-        return chunks
-
-    @staticmethod
-    def _process_policy_section_consolidated(section_content: str, section_title: str, language: str, section_idx: int) -> List[Chunk]:
-        """Process policy sections by consolidating related clauses"""
-        chunks = []
-        
-        script_group = TextProcessingUtils.get_script_group(language, LanguageConstants.SCRIPT_GROUPS)
-        clauses = ImprovedChunkingUtils._extract_policy_clauses_improved(section_content, script_group)
-        
-        if clauses:
-            # Group clauses into chunks (4 clauses per chunk)
-            chunk_size = 4
-            
-            for i in range(0, len(clauses), chunk_size):
-                batch = clauses[i:i + chunk_size]
-                
-                consolidated_text = f"Policy Section: {section_title}\n\n"
-                for j, clause in enumerate(batch):
-                    consolidated_text += f"Clause {i+j+1}: {clause}\n\n"
-                
-                policy_chunk = Chunk(
-                    text=consolidated_text.strip(),
-                    section=section_title,
-                    type="policy_consolidated",
-                    metadata=ChunkMetadata(
-                        hasQuestion=False,
-                        documentType='policy',
-                        sectionType='policy',
-                        language=language,
-                        chunkIndex=len(chunks),
-                        totalChunks=0,
-                        sectionIndex=section_idx,
-                        contentScore=1.0
-                    )
-                )
-                chunks.append(policy_chunk)
-        else:
-            content_chunks = ImprovedChunkingUtils._create_consolidated_chunks(
-                section_content, section_title, 'policy', language, section_idx
-            )
-            chunks.extend(content_chunks)
-        
-        return chunks
-
-    @staticmethod
-    def _create_consolidated_chunks(content: str, section_title: str, section_type: str, language: str, section_idx: int) -> List[Chunk]:
-        """Create consolidated chunks for non-FAQ, non-policy content"""
-        chunks = []
-        
-        paragraphs = [p.strip() for p in re.split(r'\n\s*\n', content) if p.strip()]
-        if not paragraphs:
-            return chunks
-        
-        # Target: 800-1200 characters per chunk
-        target_size = 1000
-        max_size = 1200
-        min_size = 600
-        
-        current_chunk = []
-        current_size = 0
-        
-        for paragraph in paragraphs:
-            para_size = len(paragraph)
-            
-            if para_size > max_size:
-                # Save current chunk if exists
-                if current_chunk:
-                    chunk_text = "\n\n".join(current_chunk)
-                    chunk = ImprovedChunkingUtils._create_content_chunk(
-                        chunk_text, section_title, section_type, language, section_idx, len(chunks)
-                    )
-                    chunks.append(chunk)
-                    current_chunk = []
-                    current_size = 0
-                
-                # Split large paragraph into sentences
-                sentences = TextProcessingUtils.split_into_sentences(
-                    paragraph, language, LanguageConstants.SCRIPT_GROUPS, LanguageConstants.SENTENCE_END_MARKERS
-                )
-                
-                sentence_chunk = []
-                sentence_size = 0
-                
-                for sentence in sentences:
-                    sentence = sentence.strip()
-                    if not sentence:
-                        continue
-                        
-                    sent_len = len(sentence)
-                    
-                    if sentence_size + sent_len > max_size and sentence_chunk:
-                        chunk_text = " ".join(sentence_chunk)
-                        chunk = ImprovedChunkingUtils._create_content_chunk(
-                            chunk_text, section_title, section_type, language, section_idx, len(chunks)
-                        )
-                        chunks.append(chunk)
-                        sentence_chunk = [sentence]
-                        sentence_size = sent_len
-                    else:
-                        sentence_chunk.append(sentence)
-                        sentence_size += sent_len
-                
-                if sentence_chunk:
-                    chunk_text = " ".join(sentence_chunk)
-                    chunk = ImprovedChunkingUtils._create_content_chunk(
-                        chunk_text, section_title, section_type, language, section_idx, len(chunks)
-                    )
-                    chunks.append(chunk)
-                
-            elif current_size + para_size > max_size and current_chunk:
-                chunk_text = "\n\n".join(current_chunk)
-                chunk = ImprovedChunkingUtils._create_content_chunk(
-                    chunk_text, section_title, section_type, language, section_idx, len(chunks)
-                )
-                chunks.append(chunk)
-                current_chunk = [paragraph]
-                current_size = para_size
             else:
-                current_chunk.append(paragraph)
-                current_size += para_size
+                # No Q&A pairs found, treat as regular content
+                chunks.append(ImprovedChunkingUtils._create_single_section_chunk(
+                    section_content, section_title, section_type, overall_doc_type, language, section_idx
+                ))
         
-        # Add final chunk
-        if current_chunk:
-            chunk_text = "\n\n".join(current_chunk)
-            if len(chunk_text.strip()) >= min_size:
-                chunk = ImprovedChunkingUtils._create_content_chunk(
-                    chunk_text, section_title, section_type, language, section_idx, len(chunks)
-                )
-                chunks.append(chunk)
+        elif section_type == 'policy':
+            # Create ONE consolidated policy chunk
+            chunks.append(ImprovedChunkingUtils._create_single_section_chunk(
+                section_content, section_title, section_type, overall_doc_type, language, section_idx
+            ))
+        
+        else:
+            # For other section types, create ONE chunk per section (not multiple)
+            # Only split if section is extremely large (> 6000 chars)
+            if len(section_content) > 6000:
+                # Split into max 2-3 chunks for very large sections
+                chunks.extend(ImprovedChunkingUtils._create_minimal_chunks(
+                    section_content, section_title, section_type, overall_doc_type, language, section_idx
+                ))
+            else:
+                chunks.append(ImprovedChunkingUtils._create_single_section_chunk(
+                    section_content, section_title, section_type, overall_doc_type, language, section_idx
+                ))
         
         return chunks
 
     @staticmethod
-    def _create_content_chunk(text: str, section_title: str, section_type: str, language: str, 
-                             section_idx: int, chunk_idx: int) -> Chunk:
-        """Create standardized content chunk"""
+    def _create_single_section_chunk(content: str, title: str, section_type: str, doc_type: str, language: str, section_idx: int) -> Chunk:
+        """Create a single chunk for an entire section"""
         return Chunk(
-            text=text,
-            section=section_title,
-            type=f"{section_type}_content",
+            text=f"Section: {title}\n\n{content}",
+            section=title,
+            type=f"{section_type}_section",
             metadata=ChunkMetadata(
-                hasQuestion=False,
-                documentType='general',
+                hasQuestion=(section_type == 'faq'),
+                documentType=doc_type,
                 sectionType=section_type,
                 language=language,
-                chunkIndex=chunk_idx,
-                totalChunks=0,
                 sectionIndex=section_idx,
                 contentScore=1.0
             )
         )
+
+    @staticmethod
+    def _create_minimal_chunks(content: str, title: str, section_type: str, doc_type: str, language: str, section_idx: int) -> List[Chunk]:
+        """Create minimal chunks for very large sections (max 2-3 chunks)"""
+        chunks = []
+        
+        # Split into paragraphs
+        paragraphs = [p.strip() for p in re.split(r'\n\s*\n', content) if p.strip()]
+        if not paragraphs:
+            return [ImprovedChunkingUtils._create_single_section_chunk(content, title, section_type, doc_type, language, section_idx)]
+        
+        # Target: max 3 chunks, each around 2000-3000 chars
+        target_chunks = min(3, max(1, len(content) // 2500))
+        paras_per_chunk = max(1, len(paragraphs) // target_chunks)
+        
+        chunk_num = 1
+        for i in range(0, len(paragraphs), paras_per_chunk):
+            chunk_paragraphs = paragraphs[i:i + paras_per_chunk]
+            chunk_content = '\n\n'.join(chunk_paragraphs)
+            
+            chunk_title = f"{title} - Part {chunk_num}" if target_chunks > 1 else title
+            
+            chunk = Chunk(
+                text=f"Section: {chunk_title}\n\n{chunk_content}",
+                section=title,
+                type=f"{section_type}_section",
+                metadata=ChunkMetadata(
+                    hasQuestion=(section_type == 'faq'),
+                    documentType=doc_type,
+                    sectionType=section_type,
+                    language=language,
+                    sectionIndex=section_idx,
+                    contentScore=1.0
+                )
+            )
+            chunks.append(chunk)
+            chunk_num += 1
+        
+        return chunks
 
     @staticmethod
     def _extract_qa_pairs_improved(text: str, language: str) -> List[Tuple[str, str]]:
@@ -428,27 +302,6 @@ class ImprovedChunkingUtils:
         return qa_pairs
 
     @staticmethod
-    def _extract_policy_clauses_improved(text: str, script_group: str) -> List[str]:
-        """Improved policy clause extraction"""
-        clauses = []
-        
-        if script_group == 'cjk':
-            clause_pattern = r'(?:^|\n)\s*(?:\d+|[一二三四五六七八九十]+)[\.．、]\s*(.*?)(?=\n\s*(?:\d+|[一二三四五六七八九十]+)[\.．、]|\Z)'
-        elif script_group in ['devanagari', 'bengali', 'dravidian', 'gurmukhi', 'gujarati']:
-            clause_pattern = r'(?:^|\n)\s*(?:\d+|[१२३४५६७८९०]+)[\.।]\s*(.*?)(?=\n\s*(?:\d+|[१२३४५६७८९०]+)[\.।]|\Z)'
-        elif script_group == 'arabic':
-            clause_pattern = r'(?:^|\n)\s*(?:\d+|[١٢٣٤٥٦٧٨٩٠]+)[\.،]\s*(.*?)(?=\n\s*(?:\d+|[١٢٣٤٥٦٧٨٩٠]+)[\.،]|\Z)'
-        else:
-            clause_pattern = r'(?:^|\n)\s*\d+\.\s*(.*?)(?=\n\s*\d+\.|\Z)'
-        
-        for match in re.finditer(clause_pattern, text, re.DOTALL):
-            clause = match.group(1).strip()
-            if clause and len(clause) > 20:
-                clauses.append(clause)
-        
-        return clauses
-
-    @staticmethod
     def _optimize_chunks(chunks: List[Chunk], overall_doc_type: str) -> List[Chunk]:
         """Optimize chunks by removing duplicates and improving quality"""
         if not chunks:
@@ -457,18 +310,69 @@ class ImprovedChunkingUtils:
         # Remove very short chunks
         filtered_chunks = []
         for chunk in chunks:
-            if len(chunk.text.strip()) >= 50:
+            if len(chunk.text.strip()) >= 100:  # Increased minimum length
                 filtered_chunks.append(chunk)
         
-        # Remove near-duplicate chunks
+        # Remove near-duplicate chunks based on content similarity
         final_chunks = []
-        seen_texts = set()
+        seen_content = set()
         
         for chunk in filtered_chunks:
-            simplified = re.sub(r'\s+', ' ', chunk.text.lower()[:200])
+            # Create a signature based on first 200 chars
+            content_signature = re.sub(r'\s+', ' ', chunk.text.lower()[:200]).strip()
             
-            if simplified not in seen_texts:
-                seen_texts.add(simplified)
+            if content_signature not in seen_content:
+                seen_content.add(content_signature)
                 final_chunks.append(chunk)
         
         return final_chunks
+
+
+    # Usage example to integrate both classes:
+    def process_document_complete(text: str, language: str = 'en') -> List[Chunk]:
+        """
+        Complete document processing pipeline that produces optimal chunks.
+        
+        Expected output for your document: 8-12 chunks instead of 45
+        """
+        
+        # Step 1: Identify sections using improved section detection
+        sections = DocumentSectionUtils.identify_document_sections(
+            text=text,
+            language=language,
+            max_section_length=4000,  # Higher threshold
+            min_section_length=300,   # Higher minimum
+            overlap_sentences=1       # Minimal overlap
+        )
+        
+        print(f"✅ Found {len(sections)} document sections")
+        
+        # Step 2: Create intelligent chunks from sections
+        chunks = ImprovedChunkingUtils.extract_chunks_with_section_analysis(
+            text=text,
+            language=language,
+            sections=sections
+        )
+        
+        print(f"✅ Created {len(chunks)} optimized chunks")
+        
+        return chunks
+
+
+    # Expected results for your Convonest document:
+    """
+    Instead of 45 chunks, you should get approximately 8-12 chunks:
+
+    1. "Platform Overview" (1 chunk)
+    2. "Platform Features" (1-2 chunks if very large)
+    3. "Pricing Plans" (1 chunk)
+    4. "Core Features Included in All Plans" (1 chunk)
+    5. "Why Choose Convonest" (1 chunk)
+    6. "Getting Started Guide" (1 chunk)
+    7. "Technical Specifications" (1 chunk)
+    8. "Leadership Team" (1 chunk)
+    9. "Frequently Asked Questions" (1 consolidated FAQ chunk)
+    10. "Contact Information" (1 chunk)
+
+    Total: ~10 chunks with minimal duplication and proper context preservation
+    """

@@ -158,12 +158,18 @@ Rules:
                 "temperature": 0.1
             }
 
+            start_time = datetime.datetime.now()
+
+
             response = await self.http_client.post(
                 MISTRAL_CONFIG['chat_url'],
                 headers={"Content-Type": "application/json"},
                 json=data,
                 timeout=MISTRAL_CONFIG['timeout']
             )
+            end_time = datetime.datetime.now()
+            duration = (end_time - start_time).total_seconds()
+            logger.info(f"Mistral API response received in {duration:.3f} seconds")
             
             if response.status_code != 200:
                 return self._fallback_extraction(text, section_title, max_keywords)
@@ -176,7 +182,8 @@ Rules:
                 try:
                     extraction_data = json.loads(content)
                     return self._process_mistral_extraction(extraction_data, text, max_keywords)
-                except json.JSONDecodeError:
+                except json.JSONDecodeError as ex:
+                    logger.error(f"Json decode error: {str(ex)}")
                     return self._fallback_extraction(text, section_title, max_keywords)
             
             return self._fallback_extraction(text, section_title, max_keywords)
@@ -249,7 +256,7 @@ Rules:
         sections = DocumentSectionUtils.identify_document_sections(content, language)
         chunks = ImprovedChunkingUtils.extract_chunks_with_section_analysis(content, language, sections)
         
-        logger.info(f"Created {len(chunks)} optimized chunks (improved from potential 156+ fragments)")
+        logger.info(f"Created {len(chunks)} optimized chunks)")
         
         # Process each chunk with ORIGINAL schema
         indexing_tasks = []
@@ -258,9 +265,11 @@ Rules:
             vector = self.st_model.encode(chunk.text).tolist()
             
             # Extract simple keywords
-            extracted_keywords = await self.extract_keywords_and_context_with_mistral(
-                chunk.text, chunk.section, language, max_keywords=15
-            )
+            # extracted_keywords = await self.extract_keywords_and_context_with_mistral(
+            #     chunk.text, chunk.section, language, max_keywords=15
+            # )
+            extracted_keywords = {}
+
             
             keywords = extracted_keywords.get('keywords', [])
             context_summary = extracted_keywords.get('context_summary', '')
