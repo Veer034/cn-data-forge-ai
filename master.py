@@ -15,6 +15,7 @@ from confluent_kafka import Consumer, Producer, KafkaError
 from contextvars import ContextVar
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+from typing import Optional
 
 # Import all our utility modules
 from multilingual_processor import MultilingualMessageProcessor, tracking_id_var
@@ -80,6 +81,8 @@ class MultilingualProcessorApplication:
         
         self.processor = None
         self.shutdown_requested = False
+        self.stop_event: Optional[asyncio.Event] = None  # will be created when loop is available
+     
         
         # Thread pool for CPU-bound operations
         self.thread_pool = ThreadPoolExecutor(max_workers=self.system_config.thread_pool_size)
@@ -93,9 +96,6 @@ class MultilingualProcessorApplication:
         self.active_document_tasks: Set[asyncio.Task] = set()
         self.active_faq_tasks: Set[asyncio.Task] = set()
         
-        # Setup signal handlers for graceful shutdown
-        signal.signal(signal.SIGINT, self._signal_handler)
-        signal.signal(signal.SIGTERM, self._signal_handler)
         logger.info("Signal handlers configured for graceful shutdown")
         
         # Statistics
@@ -106,6 +106,35 @@ class MultilingualProcessorApplication:
         self.document_concurrent_peak = 0
         self.faq_concurrent_peak = 0
         
+
+    async def setup_signal_handlers(self):
+        """Register asyncio-friendly signal handlers on the running loop."""
+        loop = asyncio.get_running_loop()
+        if self.stop_event is None:
+            self.stop_event = asyncio.Event()
+
+        # guard to log only on first signal
+        first_signal = {"seen": False}
+
+        def _sync_on_signal(sig_name):
+            if not first_signal["seen"]:
+                logger.info(f"Received signal {sig_name}, initiating graceful shutdown...")
+                first_signal["seen"] = True
+            # mark request
+            self.shutdown_requested = True
+            # set event so tasks waiting on it will wake
+            if not self.stop_event.is_set():
+                self.stop_event.set()
+
+        # Use loop.add_signal_handler for SIGINT and SIGTERM
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            try:
+                loop.add_signal_handler(sig, lambda s=sig: _sync_on_signal(s))
+            except NotImplementedError:
+                # Windows / event loop limitations: fallback to signal.signal
+                signal.signal(sig, lambda s, f: _sync_on_signal(s))
+
+
     def _signal_handler(self, sig, frame):
         """Handle shutdown signals gracefully"""
         logger.info(f"Received signal {sig}, initiating graceful shutdown...")
@@ -247,208 +276,145 @@ class MultilingualProcessorApplication:
             request_id
         )
 
+
     async def run_document_consumer(self):
-        """Run the document consumer loop with parallel processing"""
+        """Run document consumer loop with graceful shutdown"""
         logger.info(f"Starting document consumer for topic: {self.processor.document_request_topic}")
         consumer = Consumer(self.processor.consumer_config)
-        
+        loop = asyncio.get_running_loop()
+
         try:
             consumer.subscribe([self.processor.document_request_topic])
             logger.info(f"✓ Document consumer subscribed to topic: {self.processor.document_request_topic}")
-            
+
             message_count = 0
             last_heartbeat = datetime.now()
-            
+
             while not self.shutdown_requested:
-                msg = consumer.poll(self.system_config.kafka_poll_timeout)
-                
-                # Send periodic heartbeat logs with stats
-                now = datetime.now()
-                if (now - last_heartbeat).seconds >= 30:
-                    active_count = len(self.active_document_tasks)
-                    self.document_concurrent_peak = max(self.document_concurrent_peak, active_count)
-                    logger.info(f"Document processor heartbeat - Status: RUNNING | "
-                              f"Processed: {self.document_processed_count} | Failed: {self.document_failed_count} | "
-                              f"Active: {active_count} | Peak Concurrent: {self.document_concurrent_peak}")
-                    last_heartbeat = now
-                
+                if self.stop_event is not None and self.stop_event.is_set():
+                    logger.info("Shutdown requested, stopping consumption of new document messages")
+                    break
+
+                msg = await loop.run_in_executor(None, consumer.poll, self.system_config.kafka_poll_timeout)
+
                 if msg is None:
-                    # Clean up completed tasks
-                    completed_tasks = [task for task in self.active_document_tasks if task.done()]
+                    completed_tasks = [t for t in self.active_document_tasks if t.done()]
                     for task in completed_tasks:
                         self.active_document_tasks.remove(task)
                         try:
-                            await task  # Get any exceptions
-                            consumer.commit()  # Commit offset for successful tasks
+                            await task
+                            consumer.commit()
                         except Exception as e:
                             logger.error(f"Document task completed with error: {e}")
-                    await asyncio.sleep(0.01)  # Prevent busy waiting
+                    await asyncio.sleep(0.01)
                     continue
-                
+
                 if msg.error():
-                    if msg.error().code() == KafkaError._PARTITION_EOF:
-                        logger.debug(f"Reached end of partition {msg.partition()}")
-                    else:
+                    if msg.error().code() != KafkaError._PARTITION_EOF:
                         logger.error(f"Document consumer error: {msg.error()}")
                     continue
-                
-                # Process message in parallel
+
                 try:
                     value = KafkaUtils.parse_message(msg.value())
                     message_count += 1
-                    tenant_id = value.get('tenantId', 'unknown')
-                    document_id = value.get('documentId', 'unknown')
-                    
-                    # Get headers
+                    tenant_id = value.get("tenantId", "unknown")
                     kafka_headers = dict(msg.headers() or [])
-                    
-                    logger.info(f"📄 Processing document message #{message_count} | Tenant: {tenant_id} | Document: {document_id}")
-                    
-                    # Create task for parallel processing
+
+                    logger.info(f"📄 Processing document message #{message_count} | Tenant: {tenant_id}")
+
                     task = asyncio.create_task(
                         self.process_document_message_with_semaphore(
                             value,
-                            msg.key().decode('utf-8') if msg.key() else str(tenant_id),
+                            msg.key().decode("utf-8") if msg.key() else str(tenant_id),
                             kafka_headers
                         )
                     )
                     self.active_document_tasks.add(task)
-                    
-                    # Clean up completed tasks periodically
-                    if len(self.active_document_tasks) > self.system_config.max_concurrent_messages * 2:
-                        completed_tasks = [task for task in self.active_document_tasks if task.done()]
-                        for task in completed_tasks:
-                            self.active_document_tasks.remove(task)
-                            try:
-                                await task
-                                consumer.commit()  # Commit offset for successful tasks
-                            except Exception as e:
-                                logger.error(f"Document task failed: {e}")
-                    
+
                 except Exception as e:
-                    logger.error(f"Error creating document processing task for message #{message_count}: {str(e)}", exc_info=True)
-                    
-        except KeyboardInterrupt:
-            logger.info("Keyboard interrupt received during document message consumption")
+                    logger.error(f"Error creating document processing task #{message_count}: {e}", exc_info=True)
+
         finally:
-            # Wait for all active document tasks to complete
             if self.active_document_tasks:
-                logger.info(f"Waiting for {len(self.active_document_tasks)} active document tasks to complete...")
-                completed, pending = await asyncio.wait(
-                    self.active_document_tasks,
-                    timeout=30.0,  # Give 30 seconds for graceful completion
-                    return_when=asyncio.ALL_COMPLETED
-                )
-                
-                # Cancel any remaining tasks
-                for task in pending:
-                    task.cancel()
-                    
-                logger.info(f"Completed {len(completed)} document tasks, cancelled {len(pending)} tasks")
-            
-            consumer.close()
+                logger.info(f"Waiting for {len(self.active_document_tasks)} active document tasks to finish...")
+                completed, pending = await asyncio.wait(self.active_document_tasks, return_when=asyncio.ALL_COMPLETED)
+                logger.info(f"Completed {len(completed)} document tasks")
+            try:
+                consumer.close()
+            except Exception:
+                logger.exception("Error closing document consumer")
             logger.info("📄 Document Kafka consumer closed")
 
+
     async def run_faq_consumer(self):
-        """Run the FAQ consumer loop with parallel processing"""
+        """Run FAQ consumer loop with graceful shutdown"""
         logger.info(f"Starting FAQ consumer for topic: {self.processor.faq_request_topic}")
         consumer = Consumer(self.processor.consumer_config)
-        
+        loop = asyncio.get_running_loop()
+
         try:
             consumer.subscribe([self.processor.faq_request_topic])
             logger.info(f"✓ FAQ consumer subscribed to topic: {self.processor.faq_request_topic}")
-            
+
             message_count = 0
             last_heartbeat = datetime.now()
-            
+
             while not self.shutdown_requested:
-                msg = consumer.poll(self.system_config.kafka_poll_timeout)
-                
-                # Send periodic heartbeat logs with stats
-                now = datetime.now()
-                if (now - last_heartbeat).seconds >= 30:
-                    active_count = len(self.active_faq_tasks)
-                    self.faq_concurrent_peak = max(self.faq_concurrent_peak, active_count)
-                    logger.info(f"FAQ processor heartbeat - Status: RUNNING | "
-                              f"Processed: {self.faq_processed_count} | Failed: {self.faq_failed_count} | "
-                              f"Active: {active_count} | Peak Concurrent: {self.faq_concurrent_peak}")
-                    last_heartbeat = now
-                
+                if self.stop_event is not None and self.stop_event.is_set():
+                    logger.info("Shutdown requested, stopping consumption of new FAQ messages")
+                    break
+
+                msg = await loop.run_in_executor(None, consumer.poll, self.system_config.kafka_poll_timeout)
+
                 if msg is None:
-                    # Clean up completed tasks
-                    completed_tasks = [task for task in self.active_faq_tasks if task.done()]
+                    completed_tasks = [t for t in self.active_faq_tasks if t.done()]
                     for task in completed_tasks:
                         self.active_faq_tasks.remove(task)
                         try:
-                            await task  # Get any exceptions
-                            consumer.commit()  # Commit offset for successful tasks
+                            await task
+                            consumer.commit()
                         except Exception as e:
                             logger.error(f"FAQ task completed with error: {e}")
-                    await asyncio.sleep(0.01)  # Prevent busy waiting
+                    await asyncio.sleep(0.01)
                     continue
-                
+
                 if msg.error():
-                    if msg.error().code() == KafkaError._PARTITION_EOF:
-                        logger.debug(f"Reached end of partition {msg.partition()}")
-                    else:
+                    if msg.error().code() != KafkaError._PARTITION_EOF:
                         logger.error(f"FAQ consumer error: {msg.error()}")
                     continue
-                
-                # Process message in parallel
+
                 try:
                     value = KafkaUtils.parse_message(msg.value())
                     message_count += 1
-                    tenant_id = value.get('tenantId', 'unknown')
-                    
-                    # Get headers
+                    tenant_id = value.get("tenantId", "unknown")
                     kafka_headers = dict(msg.headers() or [])
-                    
+
                     logger.info(f"❓ Processing FAQ message #{message_count} | Tenant: {tenant_id}")
-                    
-                    # Create task for parallel processing
+
                     task = asyncio.create_task(
                         self.process_faq_message_with_semaphore(
                             value,
-                            msg.key().decode('utf-8') if msg.key() else str(tenant_id),
+                            msg.key().decode("utf-8") if msg.key() else str(tenant_id),
                             kafka_headers
                         )
                     )
                     self.active_faq_tasks.add(task)
-                    
-                    # Clean up completed tasks periodically
-                    if len(self.active_faq_tasks) > self.system_config.max_concurrent_messages * 2:
-                        completed_tasks = [task for task in self.active_faq_tasks if task.done()]
-                        for task in completed_tasks:
-                            self.active_faq_tasks.remove(task)
-                            try:
-                                await task
-                                consumer.commit()  # Commit offset for successful tasks
-                            except Exception as e:
-                                logger.error(f"FAQ task failed: {e}")
-                    
+
                 except Exception as e:
-                    logger.error(f"Error creating FAQ processing task for message #{message_count}: {str(e)}", exc_info=True)
-                    
-        except KeyboardInterrupt:
-            logger.info("Keyboard interrupt received during FAQ message consumption")
+                    logger.error(f"Error creating FAQ processing task #{message_count}: {e}", exc_info=True)
+
         finally:
-            # Wait for all active FAQ tasks to complete
             if self.active_faq_tasks:
-                logger.info(f"Waiting for {len(self.active_faq_tasks)} active FAQ tasks to complete...")
-                completed, pending = await asyncio.wait(
-                    self.active_faq_tasks,
-                    timeout=30.0,  # Give 30 seconds for graceful completion
-                    return_when=asyncio.ALL_COMPLETED
-                )
-                
-                # Cancel any remaining tasks
-                for task in pending:
-                    task.cancel()
-                    
-                logger.info(f"Completed {len(completed)} FAQ tasks, cancelled {len(pending)} tasks")
-            
-            consumer.close()
+                logger.info(f"Waiting for {len(self.active_faq_tasks)} active FAQ tasks to finish...")
+                completed, pending = await asyncio.wait(self.active_faq_tasks, return_when=asyncio.ALL_COMPLETED)
+                logger.info(f"Completed {len(completed)} FAQ tasks")
+            try:
+                consumer.close()
+            except Exception:
+                logger.exception("Error closing FAQ consumer")
             logger.info("❓ FAQ Kafka consumer closed")
+
+
 
     async def run(self):
         """Main application run method with parallel processing"""
@@ -457,6 +423,8 @@ class MultilingualProcessorApplication:
             if not await self.initialize():
                 logger.error("Failed to initialize the system")
                 return False
+            
+            await self.setup_signal_handlers()
             
             logger.info("=" * 60)
             logger.info("SERVER STARTED SUCCESSFULLY!")
@@ -473,7 +441,7 @@ class MultilingualProcessorApplication:
             # Start consuming messages concurrently with parallel processing
             await asyncio.gather(
                 self.run_document_consumer(),
-                self.run_faq_consumer()
+                self.run_faq_consumer(),
             )
             
         except KeyboardInterrupt:
