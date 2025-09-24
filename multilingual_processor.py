@@ -265,10 +265,9 @@ Rules:
             vector = self.st_model.encode(chunk.text).tolist()
             
             # Extract simple keywords
-            # extracted_keywords = await self.extract_keywords_and_context_with_mistral(
-            #     chunk.text, chunk.section, language, max_keywords=15
-            # )
-            extracted_keywords = {}
+            extracted_keywords = await self.extract_keywords_and_context_with_mistral(
+                chunk.text, chunk.section, language, max_keywords=15
+            )
 
             
             keywords = extracted_keywords.get('keywords', [])

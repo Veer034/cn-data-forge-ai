@@ -103,7 +103,7 @@ Build with new code
 
 Remove old venv
 
-    rm -rf venv
+    rm -rf myvenv
 
 Install Python
 
@@ -123,7 +123,7 @@ Install library in local VM
     #Required for kafka confluent
     brew install librdkafka
 
-    pip install "numpy<2.0.0" aiohttp sentence-transformers elasticsearch confluent-kafka httpx nltk python-dotenv transformers langdetect pydantic
+    pip install "numpy<2.0.0" aiohttp sentence-transformers elasticsearch confluent-kafka httpx nltk python-dotenv transformers langdetect pydantic psutil uvloop
 
     #For language detection
     pip install langdetect fasttext lingua-language-detector pycld2 polyglot pyicu morfessor
@@ -156,7 +156,7 @@ deactivate your virtual environment if it's active:
 
 ### Install library in production VM
 
-    pip install "numpy<2.0.0" aiohttp sentence-transformers elasticsearch confluent-kafka httpx nltk python-dotenv transformers langdetect pydantic
+    pip install "numpy<2.0.0" aiohttp sentence-transformers elasticsearch confluent-kafka httpx nltk python-dotenv transformers langdetect pydantic psutil
 
     # Install all required build tools and dependencies for language libraries
     sudo apt update
