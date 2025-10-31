@@ -265,9 +265,10 @@ Rules:
             vector = self.st_model.encode(chunk.text).tolist()
             
             # Extract simple keywords
-            extracted_keywords = await self.extract_keywords_and_context_with_mistral(
-                chunk.text, chunk.section, language, max_keywords=15
-            )
+            # NOTE:: Not using mistral for keyword extraction as its slowing down process
+            # extracted_keywords = await self.extract_keywords_and_context_with_mistral(
+            #     chunk.text, chunk.section, language, max_keywords=15
+            # )
 
             
             keywords = extracted_keywords.get('keywords', [])
@@ -475,7 +476,7 @@ Rules:
             await self.es_client.indices.create(
                 index=chunks_index,
                 settings={
-                    "number_of_shards": 1,
+                    "number_of_shards": 3,
                     "number_of_replicas": 1,
                     "analysis": {
                         "analyzer": {
