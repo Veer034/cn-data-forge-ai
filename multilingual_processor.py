@@ -271,9 +271,13 @@ Rules:
             # )
 
             
-            keywords = extracted_keywords.get('keywords', [])
-            context_summary = extracted_keywords.get('context_summary', '')
-            
+            # keywords = extracted_keywords.get('keywords', [])
+            # context_summary = extracted_keywords.get('context_summary', '')
+            keywords = []
+            context_summary = ''
+
+
+
             # Prepare metadata (keep original structure)
             combined_metadata = {**metadata}
             combined_metadata.update(chunk.metadata.model_dump())
