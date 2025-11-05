@@ -471,9 +471,9 @@ Rules:
         return await future
 
     async def _setup_elasticsearch_indices(self):
-        """Setup Elasticsearch with ORIGINAL schema"""
+        """Setup Elasticsearch with local schema (full metadata fields)"""
         
-        chunks_index = self.es_config['tenant_document_index_name']
+        chunks_index = self.es_config["tenant_document_index_name"]
         exists = await self.es_client.indices.exists(index=chunks_index)
         
         if not exists:
@@ -494,7 +494,6 @@ Rules:
                 },
                 mappings={
                     "properties": {
-                        # ORIGINAL schema - no changes
                         "content": {"type": "text"},
                         "contentVector": {
                             "type": "dense_vector",
@@ -506,7 +505,6 @@ Rules:
                         "documentId": {"type": "keyword"},
                         "chunkType": {"type": "keyword"},
                         "sectionTitle": {"type": "text"},
-                        "metadata": {"type": "object", "enabled": True},
                         "chunkPosition": {"type": "integer"},
                         "totalChunks": {"type": "integer"},
                         "hasOverlap": {"type": "boolean"},
@@ -514,11 +512,53 @@ Rules:
                         "keywords": {"type": "keyword", "ignore_above": 100},
                         "keywordsText": {"type": "text", "analyzer": "keyword_analyzer"},
                         "language": {"type": "keyword"},
-                        "keywordCount": {"type": "integer"}
+                        "keywordCount": {"type": "integer"},
+                        "metadata": {
+                            "properties": {
+                                "chunkIndex": {"type": "long"},
+                                "contentScore": {"type": "float"},
+                                "documentType": {
+                                    "type": "text",
+                                    "fields": {
+                                        "keyword": {"type": "keyword", "ignore_above": 256}
+                                    }
+                                },
+                                "faqId": {
+                                    "type": "text",
+                                    "fields": {
+                                        "keyword": {"type": "keyword", "ignore_above": 256}
+                                    }
+                                },
+                                "hasOverlap": {"type": "boolean"},
+                                "hasQuestion": {"type": "boolean"},
+                                "language": {
+                                    "type": "text",
+                                    "fields": {
+                                        "keyword": {"type": "keyword", "ignore_above": 256}
+                                    }
+                                },
+                                "qaCount": {"type": "long"},
+                                "qaFormat": {
+                                    "type": "text",
+                                    "fields": {
+                                        "keyword": {"type": "keyword", "ignore_above": 256}
+                                    }
+                                },
+                                "sectionIndex": {"type": "long"},
+                                "sectionType": {
+                                    "type": "text",
+                                    "fields": {
+                                        "keyword": {"type": "keyword", "ignore_above": 256}
+                                    }
+                                },
+                                "totalChunks": {"type": "long"}
+                            }
+                        }
                     }
                 }
             )
-            logger.info(f"Created chunks index with original schema: {chunks_index}")
+            logger.info(f"Created chunks index with full local schema: {chunks_index}")
+
 
     async def shutdown(self):
         """Graceful shutdown of resources"""
